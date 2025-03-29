@@ -17,7 +17,15 @@
 #include <netinet/in.h>
 #include <sys/types.h>
 #include <netdb.h>
+#include <signal.h>
 
+// Signal handling for graceful termination
+volatile sig_atomic_t terminationRequested = 0;
+
+void signalHandler(int signum) {
+    (void)signum; 
+    terminationRequested = 1;
+}
 
 // --- Message protocol definitions ---
 
@@ -58,12 +66,12 @@ bool resolveHostname(const std::string& hostname, struct sockaddr_in* addr) {
 }
 
 MessageType stringToMessageType(const std::string& token) {
-    if (token == "AUTH") return MessageType::AUTH;
-    if (token == "JOIN") return MessageType::JOIN;
-    if (token == "MSG")  return MessageType::MSG;
-    if (token == "BYE")  return MessageType::BYE;
+    if (token == "AUTH")  return MessageType::AUTH;
+    if (token == "JOIN")  return MessageType::JOIN;
+    if (token == "MSG")   return MessageType::MSG;
+    if (token == "BYE")   return MessageType::BYE;
     if (token == "REPLY") return MessageType::REPLY;
-    if (token == "ERR")  return MessageType::ERR;
+    if (token == "ERR")   return MessageType::ERR;
     return MessageType::UNKNOWN;
 }
 
@@ -90,57 +98,77 @@ std::string serializeBye(const std::string& displayName) {
     return "BYE FROM " + displayName + "\r\n";
 }
 
+// Parses raw message into our ParsedMessage structure.
 ParsedMessage parseMessage(const std::string& raw) {
     ParsedMessage msg;
     std::istringstream iss(raw);
     std::string token;
     
-    iss >> token;
+    // Attempt to read the first token to identify message type
+    if (!(iss >> token)) { 
+        // no token => malformed
+        msg.type = MessageType::UNKNOWN;
+        return msg;
+    }
     msg.type = stringToMessageType(token);
     
     switch (msg.type) {
         case MessageType::AUTH:
-            iss >> msg.param1;          
-            iss >> token;               
-            iss >> msg.param2;          
-            iss >> token;               
+            // Expect: AUTH <username> AS <displayName> USING <secret>
+            if (!(iss >> msg.param1)) { msg.type = MessageType::UNKNOWN; break; }
+            if (!(iss >> token))      { msg.type = MessageType::UNKNOWN; break; }
+            if (!(iss >> msg.param2)) { msg.type = MessageType::UNKNOWN; break; }
+            if (!(iss >> token))      { msg.type = MessageType::UNKNOWN; break; }
             std::getline(iss, msg.param3);
             msg.param3.erase(msg.param3.find_last_not_of(" \r\n") + 1);
             break;
+
         case MessageType::JOIN:
-            iss >> msg.param1;          
-            iss >> token;               
-            iss >> msg.param2;          
+            // Expect: JOIN <channelID> AS <displayName>
+            if (!(iss >> msg.param1)) { msg.type = MessageType::UNKNOWN; break; }
+            if (!(iss >> token))      { msg.type = MessageType::UNKNOWN; break; }
+            if (!(iss >> msg.param2)) { msg.type = MessageType::UNKNOWN; break; }
             break;
+
         case MessageType::MSG:
-            iss >> token;               
-            iss >> msg.param1;          
-            iss >> token;               
+            // Expect: MSG FROM <displayName> IS <messageContent>
+            if (!(iss >> token))      { msg.type = MessageType::UNKNOWN; break; } // skip FROM
+            if (!(iss >> msg.param1)) { msg.type = MessageType::UNKNOWN; break; } // displayName
+            if (!(iss >> token))      { msg.type = MessageType::UNKNOWN; break; } // skip IS
             std::getline(iss, msg.param2);
             msg.param2.erase(0, msg.param2.find_first_not_of(" "));
             msg.param2.erase(msg.param2.find_last_not_of(" \r\n") + 1);
             break;
+
         case MessageType::BYE:
-            iss >> token;               
-            iss >> msg.param1;          
+            // Expect: BYE FROM <displayName>
+            if (!(iss >> token))      { msg.type = MessageType::UNKNOWN; break; }
+            if (!(iss >> msg.param1)) { msg.type = MessageType::UNKNOWN; break; }
             break;
+
         case MessageType::REPLY:
-            iss >> token;               
-            msg.param1 = token;
-            iss >> token;               
+            // Expect: REPLY <OK|NOK> IS <some content>
+            if (!(iss >> token))      { msg.type = MessageType::UNKNOWN; break; }
+            msg.param1 = token; // e.g., "OK" or "NOK"
+            if (!(iss >> token))      { msg.type = MessageType::UNKNOWN; break; } // skip "IS"
             std::getline(iss, msg.param2);
             msg.param2.erase(0, msg.param2.find_first_not_of(" "));
             msg.param2.erase(msg.param2.find_last_not_of(" \r\n") + 1);
             break;
+
         case MessageType::ERR:
-            iss >> token;               
-            iss >> msg.param1;          
-            iss >> token;               
+            // Expect: ERR FROM <displayName> IS <errorMessage>
+            if (!(iss >> token))      { msg.type = MessageType::UNKNOWN; break; } // skip FROM
+            if (!(iss >> msg.param1)) { msg.type = MessageType::UNKNOWN; break; } // displayName
+            if (!(iss >> token))      { msg.type = MessageType::UNKNOWN; break; } // skip IS
             std::getline(iss, msg.param2);
             msg.param2.erase(0, msg.param2.find_first_not_of(" "));
             msg.param2.erase(msg.param2.find_last_not_of(" \r\n") + 1);
             break;
+
         default:
+            // If the token isn’t recognized, mark the message as malformed.
+            msg.type = MessageType::UNKNOWN;
             break;
     }
     return msg;
@@ -160,33 +188,75 @@ struct ClientContext {
     std::string channelID;
 };
 
-void handleIncomingMessage(const ParsedMessage& msg, ClientContext& ctx) {
+// Validates that the given message type is allowed in the current client state.
+bool isValidTransition(ClientState state, MessageType msgType) {
+    switch (state) {
+        case ClientState::INIT:
+            // After sending AUTH, we typically expect REPLY (OK or NOK), ERR, or BYE
+            return (msgType == MessageType::REPLY ||
+                    msgType == MessageType::ERR   ||
+                    msgType == MessageType::BYE);
+        
+        case ClientState::AUTHENTICATED:
+            // Possibly the server auto-joins or sends REPLY, ERR, MSG, or BYE
+            return (msgType == MessageType::REPLY ||
+                    msgType == MessageType::ERR   ||
+                    msgType == MessageType::BYE   ||
+                    msgType == MessageType::MSG);
+
+        case ClientState::JOINED:
+            // We expect MSG, REPLY (e.g., from /join), ERR, or BYE
+            return (msgType == MessageType::MSG   ||
+                    msgType == MessageType::REPLY ||
+                    msgType == MessageType::ERR   ||
+                    msgType == MessageType::BYE);
+
+        case ClientState::TERMINATED:
+            // Once terminated, no further messages are valid
+            return false;
+    }
+    // Fallback
+    return false;
+}
+
+void handleIncomingMessage(const ParsedMessage& msg, ClientContext& ctx, int sockfd) {
     switch (msg.type) {
         case MessageType::REPLY:
             if (msg.param1 == "OK") {
                 std::cout << "Action Success: " << msg.param2 << "\n";
-                if (ctx.state == ClientState::INIT)
-                    // Since the server auto-joins you to 'general', update state to JOINED right away.
+                // If we were in INIT or AUTHENTICATED, transition to JOINED
+                if (ctx.state == ClientState::INIT || ctx.state == ClientState::AUTHENTICATED) {
                     ctx.state = ClientState::JOINED;
-                else if (ctx.state == ClientState::AUTHENTICATED)
-                    ctx.state = ClientState::JOINED;
+                }
             } else {
                 std::cout << "Action Failure: " << msg.param2 << "\n";
             }
             break;
+
         case MessageType::MSG:
             std::cout << msg.param1 << ": " << msg.param2 << "\n";
             break;
+
         case MessageType::ERR:
             std::cout << "ERROR FROM " << msg.param1 << ": " << msg.param2 << "\n";
+            // The spec says ERR leads to termination
             ctx.state = ClientState::TERMINATED;
             break;
+
         case MessageType::BYE:
             std::cout << "Connection terminated by server.\n";
             ctx.state = ClientState::TERMINATED;
             break;
+
         default:
-            std::cout << "Received unknown or unhandled message type.\n";
+        std::cout << "ERROR: Received malformed or invalid message from server.\n";
+        // Optionally, send an ERR message back if the socket is still valid.
+        std::string errMsg = "ERR FROM " + ctx.displayName + " IS Malformed message\r\n";
+        // Assuming sockfd is accessible in this context.
+        if (write(sockfd, errMsg.c_str(), errMsg.length()) < 0) {
+            perror("write ERR message");
+        }
+        ctx.state = ClientState::TERMINATED;
             break;
     }
 }
@@ -261,6 +331,7 @@ ProgramArgs parseArgs(int argc, char* argv[]) {
         throw std::runtime_error("Error: Transport protocol (-t) must be either 'tcp' or 'udp'");
     return args;
 }
+
 // TCP Client implementation with message protocol integration
 int run_tcp_client(const std::string& server_ip, int server_port) {
     // Initialize client context
@@ -335,32 +406,55 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
     bool running = true;
     char buffer[1024];
     
-    // Read server response to AUTH
-    ssize_t count = read(sockfd, buffer, sizeof(buffer) - 1);
-    if (count < 0) {
-        perror("read from socket");
-        close(sockfd);
-        return EXIT_FAILURE;
-    } else if (count == 0) {
-        std::cout << "Server closed the connection.\n";
-        close(sockfd);
-        return EXIT_FAILURE;
+    // Read server response to AUTH (the first message from server)
+    {
+        ssize_t count = read(sockfd, buffer, sizeof(buffer) - 1);
+        if (count < 0) {
+            perror("read from socket");
+            close(sockfd);
+            return EXIT_FAILURE;
+        } else if (count == 0) {
+            std::cout << "Server closed the connection.\n";
+            close(sockfd);
+            return EXIT_FAILURE;
+        }
+        
+        buffer[count] = '\0';
+        std::string received(buffer, count);
+        ParsedMessage msg = parseMessage(received);
+
+        // Check for malformed or invalid transition in the INIT state
+        if (msg.type == MessageType::UNKNOWN || !isValidTransition(ctx.state, msg.type)) {
+            std::cout << "ERROR: Protocol violation or malformed message from server.\n";
+            // Send ERR back to server
+            std::string errMsg = "ERR FROM " + ctx.displayName + " IS Protocol violation or malformed message\r\n";
+            if (write(sockfd, errMsg.c_str(), errMsg.length()) < 0) {
+                perror("write ERR message");
+            }
+            ctx.state = ClientState::TERMINATED;
+        } else {
+            handleIncomingMessage(msg, ctx, sockfd);
+        }
+        
+        if (ctx.state == ClientState::TERMINATED) {
+            close(sockfd);
+            return EXIT_FAILURE;
+        }
     }
     
-    buffer[count] = '\0';
-    std::string received(buffer, count);
-    ParsedMessage msg = parseMessage(received);
-    handleIncomingMessage(msg, ctx);
-    
-    if (ctx.state == ClientState::TERMINATED) {
-        close(sockfd);
-        return EXIT_FAILURE;
-    }
-    
-    // After successful authentication, handle further I/O using file descriptors
+    // After successful authentication, handle further I/O using select()
     fd_set readfds;
     
     while (running) {
+        if (terminationRequested) {
+            // On Ctrl-C, gracefully close
+            std::string byeMsg = serializeBye(ctx.displayName);
+            if (write(sockfd, byeMsg.c_str(), byeMsg.length()) < 0) {
+                perror("write BYE message");
+            }
+            running = false;
+            break;
+        }
         FD_ZERO(&readfds);
         FD_SET(sockfd, &readfds);
         FD_SET(STDIN_FILENO, &readfds);
@@ -389,9 +483,23 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
             
             buffer[count] = '\0';
             std::string received = std::string(buffer, count);
+
+            // Parse and validate the incoming message
             ParsedMessage msg = parseMessage(received);
-            handleIncomingMessage(msg, ctx);
+            if (msg.type == MessageType::UNKNOWN || !isValidTransition(ctx.state, msg.type)) {
+                std::cout << "ERROR: Protocol violation or malformed message from server.\n";
+                // Send ERR back to server
+                std::string errMsg = "ERR FROM " + ctx.displayName + " IS Protocol violation or malformed message\r\n";
+                if (write(sockfd, errMsg.c_str(), errMsg.length()) < 0) {
+                    perror("write ERR message");
+                }
+                ctx.state = ClientState::TERMINATED;
+            } else {
+                // Handle the valid message
+                handleIncomingMessage(msg, ctx, sockfd);
+            }
             
+            // If we have moved to TERMINATED, break the loop
             if (ctx.state == ClientState::TERMINATED) {
                 running = false;
                 break;
@@ -407,12 +515,15 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
             }
             if (input.empty()) continue;
             
+            const size_t MAX_MSG_LEN = 60000;
+            
             // Process user commands
             if (input[0] == '/') {
                 std::istringstream iss(input.substr(1));
                 std::string cmd;
                 iss >> cmd;
-                if (cmd == "join" && (ctx.state == ClientState::AUTHENTICATED || ctx.state == ClientState::JOINED)) {
+                if (cmd == "join" && 
+                   (ctx.state == ClientState::AUTHENTICATED || ctx.state == ClientState::JOINED)) {
                     std::string channelID;
                     iss >> channelID;
                     if (!channelID.empty()) {
@@ -438,6 +549,12 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
                     std::cout << "Unknown command. Type /help for available commands.\n";
                 }
             } else if (ctx.state == ClientState::JOINED) {
+                // Validate message length:
+                if (input.size() > MAX_MSG_LEN) {
+                    std::cout << "ERROR: Message exceeds maximum allowed length (" 
+                              << MAX_MSG_LEN << " characters). Truncating message.\n";
+                    input = input.substr(0, MAX_MSG_LEN);
+                }
                 std::string msgContent = serializeMsg(ctx.displayName, input);
                 if (write(sockfd, msgContent.c_str(), msgContent.length()) < 0) {
                     perror("write MSG message");
@@ -463,6 +580,8 @@ int run_udp_client(const std::string& server_ip, int server_port,
 }
 
 int main(int argc, char* argv[]) {
+    signal(SIGINT, signalHandler);
+
     try {
         ProgramArgs args = parseArgs(argc, argv);
         std::cout << "Transport protocol: " << args.transport_protocol << std::endl;
