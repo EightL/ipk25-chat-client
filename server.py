@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import socket
+import time
 
 HOST = '0.0.0.0'   # Listen on all interfaces
 PORT = 4567        # Change if you prefer another port
@@ -27,18 +28,24 @@ def handle_client(conn, addr):
             
             # Check which command was received
             if line.startswith("AUTH"):
-                # e.g. "AUTH username AS DisplayName USING secret"
+                # Delay for 6 seconds to trigger client timeout
+                # time.sleep(6)
+
                 response = "REPLY OK IS Auth success.\r\n"
                 conn.sendall(response.encode('ascii'))
             
             elif line.startswith("JOIN"):
                 # e.g. "JOIN channel AS DisplayName"
+                # time.sleep(6)
+
                 response = "REPLY OK IS Join success.\r\n"
                 conn.sendall(response.encode('ascii'))
             
             elif line.startswith("MSG"):
                 # e.g. "MSG FROM DisplayName IS Hello"
                 # Just echo or send a dummy message
+                # time.sleep(6)
+
                 response = "MSG FROM Server IS Thanks for your message.\r\n"
                 conn.sendall(response.encode('ascii'))
             

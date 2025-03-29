@@ -1,0 +1,23 @@
+# CHANGELOG
+
+## 29-03-2025
+### Added
+- Implemented graceful termination on SIGINT by sending a BYE message.
+- Added local command support for `/auth` (re-authentication) and `/rename` to update the display name.
+- Introduced message input validation and truncation for messages exceeding 60000 characters.
+- Added REPLY timeout logic (5 seconds) using select() with a timeout.
+
+### Fixed
+- Adjusted state transitions to correctly handle auto-join messages from the server.
+- Corrected parsing issues in the protocol message parser.
+
+### Known Issues
+- UDP client variant not implemented yet.
+- Some edge-case error handling (e.g., extra unexpected messages after termination) still need refinement.
+
+## 28-03-2025
+### Added
+- Basic TCP client implementation.
+- Message protocol integration with functions for AUTH, JOIN, MSG, and BYE.
+- Parsing and handling of incoming messages from the server.
+- Basic Python local server for testing

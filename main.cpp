@@ -408,6 +408,26 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
     
     // Read server response to AUTH (the first message from server)
     {
+        // Set up a 5-second timeout for authentication
+        fd_set auth_readfds;
+        struct timeval auth_tv;
+        auth_tv.tv_sec = 5;
+        auth_tv.tv_usec = 0;
+        
+        FD_ZERO(&auth_readfds);
+        FD_SET(sockfd, &auth_readfds);
+        
+        int auth_result = select(sockfd + 1, &auth_readfds, NULL, NULL, &auth_tv);
+        if (auth_result == 0) {
+            std::cout << "ERROR: Authentication response timeout (5 seconds).\n";
+            close(sockfd);
+            return EXIT_FAILURE;
+        } else if (auth_result < 0) {
+            perror("select on AUTH response");
+            close(sockfd);
+            return EXIT_FAILURE;
+        }
+        
         ssize_t count = read(sockfd, buffer, sizeof(buffer) - 1);
         if (count < 0) {
             perror("read from socket");
@@ -421,6 +441,7 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
         
         buffer[count] = '\0';
         std::string received(buffer, count);
+        std::cout << "Received response:\n" << received;  // Add debug output
         ParsedMessage msg = parseMessage(received);
 
         // Check for malformed or invalid transition in the INIT state
@@ -444,7 +465,9 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
     
     // After successful authentication, handle further I/O using select()
     fd_set readfds;
-    
+    bool waitingForReply = false;
+    time_t replyDeadline = 0;
+
     while (running) {
         if (terminationRequested) {
             // On Ctrl-C, gracefully close
@@ -459,13 +482,35 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
         FD_SET(sockfd, &readfds);
         FD_SET(STDIN_FILENO, &readfds);
         
+        // Prepare timeout if needed
+        struct timeval tv;
+        struct timeval* tv_ptr = nullptr;
+        if (waitingForReply) {
+            time_t now = time(nullptr);
+            if (now >= replyDeadline) {
+                std::cout << "ERROR: No REPLY received within 5 seconds.\n";
+                // Optionally send ERR, then close
+                close(sockfd);
+                return EXIT_FAILURE;
+            } else {
+                time_t secsLeft = replyDeadline - now;
+                tv.tv_sec  = secsLeft;
+                tv.tv_usec = 0;
+                tv_ptr = &tv;
+            }
+        }
+
         int max_fd = (sockfd > STDIN_FILENO) ? sockfd : STDIN_FILENO;
-        
-        int activity = select(max_fd + 1, &readfds, NULL, NULL, NULL);
+        int activity = select(max_fd + 1, &readfds, NULL, NULL, tv_ptr);
         if (activity < 0) {
             if (errno == EINTR) continue;
             perror("select");
             break;
+        } else if (activity == 0) {
+            // Timeout occurred, check if we were waiting for a reply
+            std::cout << "ERROR: No REPLY within 5 seconds (timeout).\n";
+            close(sockfd);
+            return EXIT_FAILURE;
         }
         
         // Handle socket input
@@ -483,9 +528,14 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
             
             buffer[count] = '\0';
             std::string received = std::string(buffer, count);
-
             // Parse and validate the incoming message
             ParsedMessage msg = parseMessage(received);
+
+            if (msg.type == MessageType::REPLY) {
+                // Got a REPLY, so clear the waiting flag.
+                waitingForReply = false;
+            }
+
             if (msg.type == MessageType::UNKNOWN || !isValidTransition(ctx.state, msg.type)) {
                 std::cout << "ERROR: Protocol violation or malformed message from server.\n";
                 // Send ERR back to server
@@ -522,30 +572,72 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
                 std::istringstream iss(input.substr(1));
                 std::string cmd;
                 iss >> cmd;
-                if (cmd == "join" && 
-                   (ctx.state == ClientState::AUTHENTICATED || ctx.state == ClientState::JOINED)) {
+                if (cmd == "join" && (ctx.state == ClientState::AUTHENTICATED || ctx.state == ClientState::JOINED)) {
                     std::string channelID;
                     iss >> channelID;
                     if (!channelID.empty()) {
                         ctx.channelID = channelID;
                         std::string joinMsg = serializeJoin(channelID, ctx.displayName);
+                        std::cout << "Sending JOIN message:\n" << joinMsg;  // Add debug output
                         if (write(sockfd, joinMsg.c_str(), joinMsg.length()) < 0) {
                             perror("write JOIN message");
                             running = false;
+                        } else {
+                            waitingForReply = true;
+                            replyDeadline = time(nullptr) + 5;
+                            std::cout << "Waiting for reply with deadline in 5 seconds...\n";  // Debug
+                        }
+                    } else {
+                        std::cout << "Error: Channel name cannot be empty\n";
+                        std::cout << "Usage: /join <channel>\n"; 
+                    }
+                } 
+                else if (cmd == "auth") {
+                    std::string newUsername, newSecret, newDisplayName;
+                    iss >> newUsername >> newSecret >> newDisplayName;
+                    if (newUsername.empty() || newSecret.empty() || newDisplayName.empty()) {
+                        std::cout << "Usage: /auth <username> <secret> <displayName>\n";
+                    } else {
+                        ctx.username = newUsername;
+                        ctx.displayName = newDisplayName;
+                        std::string authMsg = serializeAuth(newUsername, newDisplayName, newSecret);
+                        if (write(sockfd, authMsg.c_str(), authMsg.length()) < 0) {
+                            perror("write AUTH message");
+                            running = false;
+                        } else {
+                            std::cout << "Sent re-authentication message.\n";
+                            waitingForReply = true;
+                            replyDeadline = time(nullptr) + 5;
                         }
                     }
-                } else if (cmd == "bye") {
+                }
+                else if (cmd == "rename") {
+                    // Expected format: /rename <displayName>
+                    std::string newDisplayName;
+                    iss >> newDisplayName;
+                    if (newDisplayName.empty()) {
+                        std::cout << "Usage: /rename <displayName>\n";
+                    } else {
+                        ctx.displayName = newDisplayName;
+                        std::cout << "Display name updated to: " << newDisplayName << "\n";
+                    }
+                } 
+                else if (cmd == "bye") {
                     std::string byeMsg = serializeBye(ctx.displayName);
                     if (write(sockfd, byeMsg.c_str(), byeMsg.length()) < 0) {
                         perror("write BYE message");
                     }
                     running = false;
-                } else if (cmd == "help") {
+                } 
+                else if (cmd == "help") {
                     std::cout << "Available commands:\n";
-                    std::cout << "  /join <channel> - Join a channel\n";
-                    std::cout << "  /bye - Disconnect from server\n";
-                    std::cout << "  /help - Show this help\n";
-                } else {
+                    std::cout << "  /join <channel>       - Join a channel\n";
+                    std::cout << "  /auth <u> <s> <d>       - Re-authenticate with new credentials (username, secret, displayName)\n";
+                    std::cout << "  /rename <displayName>   - Change your display name locally\n";
+                    std::cout << "  /bye                  - Disconnect from server\n";
+                    std::cout << "  /help                 - Show this help\n";
+                } 
+                else {
                     std::cout << "Unknown command. Type /help for available commands.\n";
                 }
             } else if (ctx.state == ClientState::JOINED) {
