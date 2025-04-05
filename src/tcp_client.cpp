@@ -1,4 +1,6 @@
 #include "tcp_client.h"
+#include "debug.h"
+
 #include <iostream>
 #include <cstring>
 #include <sstream>
@@ -196,15 +198,8 @@ int TcpClient::run() {
     socketFd = sockfd;
     setNonBlocking(sockfd); // Set socket to non-blocking mode for epoll
 
-    // Begin protocol - Send AUTH message
-    std::string authMsg = serializeAuth(username, displayName, "33df184d-207f-42a9-b331-7ecebde96416");
-    std::cout << "Sending AUTH message:\n" << authMsg;
-    state = ClientState::AUTHENTICATING;
-    if (write(sockfd, authMsg.c_str(), authMsg.length()) < 0) {
-        perror("write AUTH message");
-        close(sockfd);
-        return EXIT_FAILURE;
-    }
+    // DO NOT send AUTH message immediately - wait for user input
+    state = ClientState::INIT;
     
     // Set up epoll for I/O multiplexing
     int epoll_fd = epoll_create1(0);
@@ -236,82 +231,7 @@ int TcpClient::run() {
         close(sockfd);
         return EXIT_FAILURE;
     }
-    
-    // Handle auth response with 5-second timeout (required by protocol)
-    {
-        auto authStart = std::chrono::steady_clock::now();
-        bool authReplyReceived = false;
-        
-        while (!authReplyReceived) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - authStart).count();
-            
-            if (elapsed >= 5000) {
-                std::cout << "ERROR: Authentication response timeout (5 seconds).\n";
-                close(epoll_fd);
-                close(sockfd);
-                return EXIT_FAILURE;
-            }
-            
-            // Calculate remaining timeout
-            int remainingTimeoutMs = 5000 - elapsed;
-            
-            epoll_event events[10];
-            int nfds = epoll_wait(epoll_fd, events, 10, remainingTimeoutMs);
-            
-            if (nfds == -1) {
-                if (errno == EINTR) continue;
-                perror("epoll_wait failed");
-                close(epoll_fd);
-                close(sockfd);
-                return EXIT_FAILURE;
-            }
-            
-            for (int i = 0; i < nfds; i++) {
-                if (events[i].data.fd == sockfd) {
-                    char buffer[1024];
-                    ssize_t count = read(sockfd, buffer, sizeof(buffer) - 1);
-                    if (count <= 0) {
-                        if (count < 0) {
-                            perror("read from socket");
-                        } else {
-                            std::cout << "Server closed the connection.\n";
-                        }
-                        close(epoll_fd);
-                        close(sockfd);
-                        return EXIT_FAILURE;
-                    }
-                    
-                    buffer[count] = '\0';
-                    std::string received(buffer, count);
-                    std::cout << "Received response:\n" << received;
-                    
-                    ParsedMessage msg = parseMessage(received);
-                    if (msg.type == MessageType::UNKNOWN || !isValidTransition(msg.type)) {
-                        std::cout << "ERROR: Protocol violation or malformed message from server.\n";
-                        std::string errMsg = "ERR FROM " + displayName + " IS Protocol violation or malformed message\r\n";
-                        if (write(sockfd, errMsg.c_str(), errMsg.length()) < 0) {
-                            perror("write error message");
-                        }
-                        close(epoll_fd);
-                        close(sockfd);
-                        return EXIT_FAILURE;
-                    } 
-                    
-                    handleIncomingMessage(msg);
-                    if (state == ClientState::TERMINATED) {
-                        close(epoll_fd);
-                        close(sockfd);
-                        return EXIT_FAILURE;
-                    }
-                    
-                    authReplyReceived = true;
-                    break;
-                }
-            }
-        }
-    }
-    
+
     // Main client loop - handle user input and server messages
     bool waitingForReply = false;
     auto replyDeadline = std::chrono::steady_clock::now();
@@ -319,9 +239,10 @@ int TcpClient::run() {
     std::string stdinBuffer;
     bool running = true;
 
-    while (running) {
+    while (running && state != ClientState::TERMINATED) {
         // Handle graceful shutdown on SIGINT
         if (terminationRequested) {
+            printf_debug("Termination requested, sending BYE");
             std::string byeMsg = serializeBye(displayName);
             if (write(sockfd, byeMsg.c_str(), byeMsg.length()) < 0) {
                 perror("write error message");

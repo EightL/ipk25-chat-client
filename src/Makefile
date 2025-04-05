@@ -1,5 +1,5 @@
 # Compiler and flags
-CXX := g++
+CXX := g++ -DDEBUG_PRINT
 CXXFLAGS := -std=c++20 -Wall -Wextra -Werror -pedantic
 LDFLAGS := 
 

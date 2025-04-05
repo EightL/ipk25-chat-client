@@ -1,4 +1,6 @@
 #include "udp_client.h"
+#include "debug.h"
+
 #include <iostream>
 #include <cstring>
 #include <sstream>
@@ -32,8 +34,7 @@ void UdpClient::checkAndUpdateServerPort(const sockaddr_in& peerAddr) {
     uint16_t incomingPort = ntohs(peerAddr.sin_port);
     
     if (currentServerPort != incomingPort) {
-        std::cout << "Server changed ports: " << currentServerPort << " -> " 
-                 << incomingPort << ". Updating connection." << std::endl;
+        printf_debug("Server changed ports: %d -> %d. Updating connection.", currentServerPort, incomingPort);
         serverAddr.sin_port = htons(incomingPort);
     }
 }
@@ -121,7 +122,7 @@ bool UdpClient::sendUdpMessage(const std::vector<char>& msg, bool requireConfirm
         auto now = std::chrono::steady_clock::now();
         auto overallElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
         if (overallElapsed >= 5000) {
-            std::cout << "Message transmission timeout (5 seconds)" << std::endl;
+            std::cout << "ERROR: Message transmission timeout (5 seconds)" << std::endl;
             return false;
         }
     }
@@ -136,7 +137,7 @@ bool UdpClient::authenticateWithRetries(const std::string& secret) {
     
     bool success = sendUdpMessage(authMsg, true);
     if (!success) {
-        std::cerr << "Authentication failed: couldn't get confirmation" << std::endl;
+        std::cerr << "ERROR: Authentication failed: couldn't get confirmation" << std::endl;
         return false;
     }
     
@@ -149,7 +150,7 @@ bool UdpClient::authenticateWithRetries(const std::string& secret) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
         
         if (elapsed >= 5000) {
-            std::cerr << "Authentication failed: no REPLY received within 5 seconds" << std::endl;
+            std::cerr << "ERROR: Authentication failed: no REPLY received within 5 seconds" << std::endl;
             return false;
         }
         
@@ -192,6 +193,11 @@ bool UdpClient::authenticateWithRetries(const std::string& secret) {
                         return false; // Authentication failed
                     }
                 }
+                else if (response.type == MessageType::ERR) {
+                    // Handle ERR message as a terminal authentication event
+                    handleIncomingMessage(response);
+                    return false; // Authentication failed due to error
+                }
                 else {
                     // Process other messages
                     handleIncomingMessage(response);
@@ -211,7 +217,40 @@ void UdpClient::processUserInput(const std::string& input) {
         std::string cmd;
         iss >> cmd;
         
-        if (cmd == "join" && state == ClientState::JOINED) {
+        if (cmd == "auth") {
+            if (state == ClientState::JOINED || state == ClientState::JOIN_WAITING) {
+                std::cout << "ERROR: Already authenticated." << std::endl;
+                return;
+            }
+            std::string newUsername, newSecret, newDisplayName;
+            iss >> newUsername >> newSecret >> newDisplayName;
+            
+            if (newUsername.empty() || newSecret.empty() || newDisplayName.empty()) {
+                std::cout << "ERROR: Invalid authentication parameters" << std::endl;
+                std::cerr << "Usage: /auth <username> <secret> <displayName>" << std::endl;
+                return;
+            }
+            
+            username = newUsername;
+            displayName = newDisplayName;
+            
+            // Store the current state to restore if authentication fails
+            ClientState previousState = state;
+            
+            // Perform authentication
+            state = ClientState::AUTHENTICATING;
+            if (!authenticateWithRetries(newSecret)) {
+                printf_debug("Authentication failed");
+                // Restore previous state if we were already authenticated
+                if (previousState == ClientState::JOINED || previousState == ClientState::JOIN_WAITING) {
+                    printf_debug("Restoring previous client state");
+                    state = previousState;
+                } else {
+                    state = ClientState::INIT;
+                }
+            }
+        }
+        else if (cmd == "join" && state == ClientState::JOINED) {
             std::string channelId;
             iss >> channelId;
             if (!channelId.empty()) {
@@ -222,22 +261,26 @@ void UdpClient::processUserInput(const std::string& input) {
                 // Send JOIN message
                 if (sendUdpMessage(joinMsg)) {
                     state = ClientState::JOIN_WAITING;
-                    std::cout << "Sent JOIN request for channel: " << channelId << std::endl;
+                    printf_debug("Sent JOIN request for channel: %s", channelId.c_str());
                 } else {
-                    std::cout << "Failed to send JOIN request." << std::endl;
+                    printf_debug("Failed to send JOIN request.");
                 }
             } else {
-                std::cout << "Error: Channel name cannot be empty\n";
-                std::cout << "Usage: /join <channel>\n";
+                std::cout << "ERROR: Channel name cannot be empty" << std::endl;
+                std::cerr << "Usage: /join <channel>" << std::endl;
             }
         }
         else if (cmd == "bye") {
             // Send BYE message
             uint16_t byeMsgId = getNextMsgId();
             std::vector<char> byeMsg = buildUdpByeMessage(byeMsgId, displayName);
-            sendto(socketFd, byeMsg.data(), byeMsg.size(), 0,
-                   reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
-            std::cout << "Sent BYE message, terminating connection." << std::endl;
+            
+            // Use sendUdpMessage with confirmation to ensure the BYE is received
+            if (sendUdpMessage(byeMsg, true)) {
+                printf_debug("BYE message confirmed by server");
+            } else {
+                printf_debug("Failed to get confirmation for BYE message");
+            }
             state = ClientState::TERMINATED;
         }
         else if (cmd == "rename") {
@@ -245,20 +288,22 @@ void UdpClient::processUserInput(const std::string& input) {
             iss >> newDisplayName;
             if (!newDisplayName.empty()) {
                 displayName = newDisplayName;
-                std::cout << "Display name updated to: " << newDisplayName << std::endl;
+                printf_debug("Display name updated to: %s", newDisplayName.c_str());
             } else {
-                std::cout << "Usage: /rename <displayName>\n";
+                std::cout << "Usage: /rename <displayName>" << std::endl;
             }
         }
         else if (cmd == "help") {
-            std::cout << "Available commands:\n";
-            std::cout << "  /join <channel>       - Join a channel\n";
-            std::cout << "  /rename <displayName> - Change display name locally\n";
-            std::cout << "  /bye                  - Disconnect from server\n";
-            std::cout << "  /help                 - Show this help\n";
+            printf_debug("Displaying available commands");
+            std::cerr << "Available commands:" << std::endl;
+            std::cerr << "  /auth <u> <s> <d>     - Authenticate with username, secret and display name" << std::endl;
+            std::cerr << "  /join <channel>       - Join a channel" << std::endl;
+            std::cerr << "  /rename <displayName> - Change display name locally" << std::endl;
+            std::cerr << "  /bye                  - Disconnect from server" << std::endl;
+            std::cerr << "  /help                 - Show this help" << std::endl;
         }
         else {
-            std::cout << "Unknown command. Type /help for available commands.\n";
+            std::cerr << "Unknown command. Type /help for available commands." << std::endl;
         }
     }
     else if (state == ClientState::JOINED) {
@@ -266,19 +311,19 @@ void UdpClient::processUserInput(const std::string& input) {
         const size_t MAX_MSG_LEN = 60000;
         std::string line = input;
         if (line.size() > MAX_MSG_LEN) {
-            std::cout << "Message truncated to " << MAX_MSG_LEN << " characters.\n";
+            std::cout << "ERROR: Message truncated to " << MAX_MSG_LEN << " characters." << std::endl;
             line = line.substr(0, MAX_MSG_LEN);
         }
         
         uint16_t msgId = getNextMsgId();
         std::vector<char> msgData = buildUdpMsgMessage(msgId, displayName, line);
         if (!sendUdpMessage(msgData)) {
-            std::cout << "Failed to send message." << std::endl;
+            printf_debug("Failed to send message");
         }
     }
     else {
-        std::cout << "You must join a channel before sending messages.\n";
-        std::cout << "Use /join <channel> to join a channel.\n";
+        std::cerr << "You must join a channel before sending messages." << std::endl;
+        std::cerr << "Use /join <channel> to join a channel." << std::endl;
     }
 }
 
@@ -373,15 +418,6 @@ int UdpClient::run() {
         return EXIT_FAILURE;
     }
     
-    // Authenticate with server
-    std::string secret = "33df184d-207f-42a9-b331-7ecebde96416"; // Hardcoded for testing
-    state = ClientState::AUTHENTICATING;
-    if (!authenticateWithRetries(secret)) {
-        std::cerr << "Authentication failed." << std::endl;
-        close(epoll_fd);
-        close(socketFd);
-        return EXIT_FAILURE;
-    }
     
     // Main event loop
     char buffer[65536]; // Large buffer for UDP messages
@@ -392,14 +428,22 @@ int UdpClient::run() {
     while (running && state != ClientState::TERMINATED) {
         // Handle Ctrl+C
         if (terminationRequested) {
-            std::cout << "Termination requested, sending BYE." << std::endl;
+            printf_debug("Termination requested, sending BYE");
             uint16_t byeMsgId = getNextMsgId();
             std::vector<char> byeMsg = buildUdpByeMessage(byeMsgId, displayName);
-            sendto(socketFd, byeMsg.data(), byeMsg.size(), 0,
-                   reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
+            
+            // Use sendUdpMessage with confirmation to ensure the BYE is received
+            if (sendUdpMessage(byeMsg, true)) {
+                printf_debug("BYE message confirmed by server");
+            } else {
+                printf_debug("Failed to get confirmation for BYE message");
+            }
             break;
         }
-        
+        if (state == ClientState::TERMINATED) {
+            printf_debug("Client in TERMINATED state, exiting main loop");
+            break;
+        }
         // Wait for events with a short timeout
         int nfds = epoll_wait(epoll_fd, events, 10, 100); // 100ms timeout
         if (nfds == -1) {

@@ -110,8 +110,8 @@ int main(int argc, char* argv[]) {
             client = new TcpClient(args.server_address, args.server_port);
         }
         
-        // Set hardcoded credentials for testing
-        client->setCredentials("xsevcim00", args.transport_protocol == "tcp" ? "tcpp" : "udpp", "33df184d-207f-42a9-b331-7ecebde96416");
+        std::cerr << "\nPlease authenticate using: /auth <username> <secret> <displayName>" << std::endl;
+
         
         result = client->run();
         delete client;
@@ -119,6 +119,6 @@ int main(int argc, char* argv[]) {
         
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
-        return 1;
+        return EXIT_FAILURE;
     }
 }

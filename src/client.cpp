@@ -108,6 +108,7 @@ void Client::handleIncomingMessage(const ParsedMessage& msg) {
         case MessageType::BYE:
             std::cout << "Connection terminated by server.\n";
             state = ClientState::TERMINATED;
+            
             break;
 
         case MessageType::PING:
