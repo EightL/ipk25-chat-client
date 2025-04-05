@@ -27,7 +27,7 @@
 #ifdef DEBUG_PRINT
 #define printf_debug(format, ...) fprintf(stderr, "%s:%-4d | %15s | " format "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
 #else
-#define printf_debug(format, ...) ((void)0)
+#define printf_debug(format, ...) (0)
 #endif
 
 // Signal handling for graceful termination (Ctrl+C)
@@ -65,9 +65,9 @@ enum class MessageType {
     UNKNOWN   // Unrecognized message
 };
 
-// /**
-//  * Converts a string token to a MessageType enum
-//  */
+/**
+ * Converts a string token to a MessageType enum
+ */
 MessageType stringToMessageType(const std::string& token) {
     if (token == "AUTH")  return MessageType::AUTH;
     if (token == "JOIN")  return MessageType::JOIN;
@@ -91,9 +91,9 @@ struct ParsedMessage {
     bool success = false; // For REPLY messages, indicates OK vs NOK
 };
 
-// /**
-//  * Message serialization functions for outgoing TCP messages
-//  */
+/**
+ * Message serialization functions for outgoing TCP messages
+ */
 std::string serializeAuth(const std::string& username, const std::string& displayName, const std::string& secret) {
     return "AUTH " + username + " AS " + displayName + " USING " + secret + "\r\n";
 }
@@ -380,7 +380,9 @@ ParsedMessage parseUdpMessage(const char* buffer, size_t length) {
     switch (msgType) {
         case CONFIRM_TYPE:
             msg.type = MessageType::CONFIRM;
-            msg.refMsgId = msg.msgId; // In CONFIRM, msgId is actually refMsgId
+            if (length >= 3) {
+                msg.refMsgId = msg.msgId; // In CONFIRM, msgId is actually refMsgId
+            }
             break;
             
         case REPLY_TYPE:
@@ -393,7 +395,8 @@ ParsedMessage parseUdpMessage(const char* buffer, size_t length) {
                 
                 // Extract message content if present
                 if (length > 6) {
-                    msg.param2 = std::string(&buffer[6]);
+                    const char* content = &buffer[6];
+                    msg.param2 = std::string(content); // Content after the null terminator
                 }
             }
             break;
@@ -401,13 +404,12 @@ ParsedMessage parseUdpMessage(const char* buffer, size_t length) {
         case MSG_TYPE:
             msg.type = MessageType::MSG;
             if (length > 3) {
-                // Extract displayName
+                // Extract displayName and content
                 const char* displayName = &buffer[3];
-                msg.param1 = std::string(displayName);
-                
-                // Find the message content (after the first null terminator)
-                const char* content = displayName + msg.param1.length() + 1;
-                if (content < buffer + length) {
+                size_t nameLen = strlen(displayName);
+                if (3 + nameLen + 1 < length) {
+                    msg.param1 = std::string(displayName);
+                    const char* content = displayName + nameLen + 1;
                     msg.param2 = std::string(content);
                 }
             }
@@ -424,13 +426,12 @@ ParsedMessage parseUdpMessage(const char* buffer, size_t length) {
         case ERR_TYPE:
             msg.type = MessageType::ERR;
             if (length > 3) {
-                // Extract displayName
+                // Extract displayName and error message
                 const char* displayName = &buffer[3];
-                msg.param1 = std::string(displayName);
-                
-                // Find error message (after the first null terminator)
-                const char* errMsg = displayName + msg.param1.length() + 1;
-                if (errMsg < buffer + length) {
+                size_t nameLen = strlen(displayName);
+                if (3 + nameLen + 1 < length) {
+                    msg.param1 = std::string(displayName);
+                    const char* errMsg = displayName + nameLen + 1;
                     msg.param2 = std::string(errMsg);
                 }
             }
@@ -466,6 +467,7 @@ void checkAndUpdateServerPort(sockaddr_in& serverAddr, const sockaddr_in& peerAd
 void handleIncomingMessage(const ParsedMessage& msg, ClientContext& ctx, int sockfd) {
     switch (msg.type) {
         case MessageType::REPLY:
+            // Per FSM: When in "join" state, any REPLY returns us to "open" state
             if (ctx.state == ClientState::JOIN_WAITING) {
                 ctx.state = ClientState::JOINED;
                 if (msg.success) {
@@ -473,15 +475,19 @@ void handleIncomingMessage(const ParsedMessage& msg, ClientContext& ctx, int soc
                 } else {
                     std::cout << "Action Failure: " << msg.param2 << "\n";
                 }
-            } else if (ctx.state == ClientState::AUTHENTICATING) {
+            }
+            // Per FSM: When in "auth" state, REPLY moves us to "open" state
+            else if (ctx.state == ClientState::AUTHENTICATING) {
                 if (msg.success) {
                     std::cout << "Authentication Success: " << msg.param2 << "\n";
-                    // Fix: Ensure we transition to JOINED state
                     ctx.state = ClientState::JOINED;
                 } else {
                     std::cout << "Authentication Failure: " << msg.param2 << "\n";
+                    // Stay in AUTHENTICATING state per FSM (auth self-loop for !REPLY)
                 }
-            } else {
+            } 
+            // In JOINED state, just show the reply
+            else {
                 if (msg.success) {
                     std::cout << "Action Success: " << msg.param2 << "\n";
                 } else {
@@ -502,11 +508,6 @@ void handleIncomingMessage(const ParsedMessage& msg, ClientContext& ctx, int soc
         case MessageType::BYE:
             std::cout << "Connection terminated by server.\n";
             ctx.state = ClientState::TERMINATED;
-            break;
-
-        case MessageType::PING:
-        // Simply ignore PING messages - they're already confirmed in the main loop
-        // We just need to prevent them from falling to the default case
             break;
 
         default:
@@ -611,10 +612,13 @@ int run_udp_client(const std::string& server_ip, int server_port,
     ClientContext ctx;
     ctx.state = ClientState::INIT; 
     ctx.isUdp = true;
-    // Hardcoded values instead of prompting
-    ctx.username = "xsevcim00";
-    ctx.displayName = "udpp";
-    std::string secret = "33df184d-207f-42a9-b331-7ecebde96416";
+    std::cout << "Enter username: ";
+    std::getline(std::cin, ctx.username);
+    std::cout << "Enter display name: ";
+    std::getline(std::cin, ctx.displayName);
+    std::string secret;
+    std::cout << "Enter secret: ";
+    std::getline(std::cin, secret);
     
     // Resolve hostname to IP if needed
     std::string resolvedIP = resolveHostname(server_ip);
@@ -811,8 +815,6 @@ int run_udp_client(const std::string& server_ip, int server_port,
                 
                 // Handle other messages
                 if (msg.type != MessageType::UNKNOWN) {
-                    printf_debug("Processing message: type=%d, param1=%s, param2=%s", 
-                                (int)msg.type, msg.param1.c_str(), msg.param2.c_str());
                     handleIncomingMessage(msg, ctx, sockfd);
                     if (msg.type == MessageType::BYE || msg.type == MessageType::ERR) {
                         running = false;
@@ -891,7 +893,6 @@ int run_udp_client(const std::string& server_ip, int server_port,
                         }
                         else if (ctx.state == ClientState::JOINED) {
                             // Send chat message
-                            printf_debug("Client is in JOINED state, sending message");
                             const size_t MAX_MSG_LEN = 60000;
                             if (line.size() > MAX_MSG_LEN) {
                                 std::cout << "Message truncated to " << MAX_MSG_LEN << " characters.\n";
@@ -904,7 +905,6 @@ int run_udp_client(const std::string& server_ip, int server_port,
                                    reinterpret_cast<sockaddr*>(&ctx.serverAddr), sizeof(ctx.serverAddr));
                         }
                         else {
-                            printf_debug("Client state is not JOINED: %d", (int)ctx.state);
                             std::cout << "You must join a channel before sending messages.\n";
                             std::cout << "Use /join <channel> to join a channel.\n";
                         }
@@ -938,10 +938,13 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
     ClientContext ctx;
     ctx.state = ClientState::INIT; 
     ctx.isUdp = false;
-    // Hardcoded values instead of prompting
-    ctx.username = "xsevcim00";
-    ctx.displayName = "tcpp";
-    std::string secret = "33df184d-207f-42a9-b331-7ecebde96416";
+    std::cout << "Enter username: ";
+    std::getline(std::cin, ctx.username);
+    std::cout << "Enter display name: ";
+    std::getline(std::cin, ctx.displayName);
+    std::string secret;
+    std::cout << "Enter secret: ";
+    std::getline(std::cin, secret);
     
     // Set up TCP connection to server using IPv4
     struct addrinfo hints;
@@ -993,7 +996,6 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
     }
 
     ctx.socketFd = sockfd;
-    setNonBlocking(sockfd); // Set socket to non-blocking mode for epoll
 
     // Begin protocol FSM - Send AUTH message (transition from start→auth)
     std::string authMsg = serializeAuth(ctx.username, ctx.displayName, secret);
@@ -1005,325 +1007,245 @@ int run_tcp_client(const std::string& server_ip, int server_port) {
         return EXIT_FAILURE;
     }
     
-    // Set up epoll for I/O multiplexing
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0) {
-        perror("epoll_create");
-        close(sockfd);
-        return EXIT_FAILURE;
-    }
-    
-    // Add socket to epoll
-    epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.fd = sockfd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sockfd, &ev) < 0) {
-        perror("epoll_ctl: sockfd");
-        close(epoll_fd);
-        close(sockfd);
-        return EXIT_FAILURE;
-    }
-    
-    // Add stdin to epoll
-    setNonBlocking(STDIN_FILENO);
-    epoll_event ev_stdin;
-    ev_stdin.events = EPOLLIN;
-    ev_stdin.data.fd = STDIN_FILENO;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, STDIN_FILENO, &ev_stdin) < 0) {
-        perror("epoll_ctl: stdin");
-        close(epoll_fd);
-        close(sockfd);
-        return EXIT_FAILURE;
-    }
-    
     // Buffer for incoming messages
     char buffer[1024];
     bool running = true;
-    std::string stdinBuffer;
     
     // Handle auth response with 5-second timeout (required by protocol)
     {
-        auto authStart = std::chrono::steady_clock::now();
-        bool authReplyReceived = false;
+        fd_set auth_readfds;
+        struct timeval auth_tv;
+        auth_tv.tv_sec = 5;
+        auth_tv.tv_usec = 0;
         
-        while (!authReplyReceived) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - authStart).count();
-            
-            if (elapsed >= 5000) {
-                std::cout << "ERROR: Authentication response timeout (5 seconds).\n";
-                close(epoll_fd);
-                close(sockfd);
-                return EXIT_FAILURE;
+        FD_ZERO(&auth_readfds);
+        FD_SET(sockfd, &auth_readfds);
+        
+        int auth_result = select(sockfd + 1, &auth_readfds, NULL, NULL, &auth_tv);
+        if (auth_result == 0) {
+            std::cout << "ERROR: Authentication response timeout (5 seconds).\n";
+            close(sockfd);
+            return EXIT_FAILURE;
+        } else if (auth_result < 0) {
+            perror("select on AUTH response");
+            close(sockfd);
+            return EXIT_FAILURE;
+        }
+        
+        ssize_t count = read(sockfd, buffer, sizeof(buffer) - 1);
+        if (count <= 0) {
+            if (count < 0) {
+                perror("read from socket");
             }
-            
-            // Calculate remaining timeout
-            int remainingTimeoutMs = 5000 - elapsed;
-            
-            epoll_event events[10];
-            int nfds = epoll_wait(epoll_fd, events, 10, remainingTimeoutMs);
-            
-            if (nfds == -1) {
-                if (errno == EINTR) continue;
-                perror("epoll_wait failed");
-                close(epoll_fd);
-                close(sockfd);
-                return EXIT_FAILURE;
-            }
-            
-            for (int i = 0; i < nfds; i++) {
-                if (events[i].data.fd == sockfd) {
-                    ssize_t count = read(sockfd, buffer, sizeof(buffer) - 1);
-                    if (count <= 0) {
-                        if (count < 0) {
-                            perror("read from socket");
-                        } else {
-                            std::cout << "Server closed the connection.\n";
-                        }
-                        close(epoll_fd);
-                        close(sockfd);
-                        return EXIT_FAILURE;
-                    }
-                    
-                    buffer[count] = '\0';
-                    std::string received(buffer, count);
-                    std::cout << "Received response:\n" << received;
-                    
-                    ParsedMessage msg = parseMessage(received);
-                    if (msg.type == MessageType::UNKNOWN || !isValidTransition(ctx.state, msg.type)) {
-                        std::cout << "ERROR: Protocol violation or malformed message from server.\n";
-                        std::string errMsg = "ERR FROM " + ctx.displayName + " IS Protocol violation or malformed message\r\n";
-                        if (write(sockfd, errMsg.c_str(), errMsg.length()) < 0) {
-                            perror("write error message");
-                        }
-                        close(epoll_fd);
-                        close(sockfd);
-                        return EXIT_FAILURE;
-                    } 
-                    
-                    handleIncomingMessage(msg, ctx, sockfd);
-                    if (ctx.state == ClientState::TERMINATED) {
-                        close(epoll_fd);
-                        close(sockfd);
-                        return EXIT_FAILURE;
-                    }
-                    
-                    authReplyReceived = true;
-                    break;
-                }
-            }
+            std::cout << "Server closed the connection.\n";
+            close(sockfd);
+            return EXIT_FAILURE;
+        }
+        
+        buffer[count] = '\0';
+        std::string received(buffer, count);
+        std::cout << "Received response:\n" << received;
+        
+        ParsedMessage msg = parseMessage(received);
+        if (msg.type == MessageType::UNKNOWN || !isValidTransition(ctx.state, msg.type)) {
+            std::cout << "ERROR: Protocol violation or malformed message from server.\n";
+            std::string errMsg = "ERR FROM " + ctx.displayName + " IS Protocol violation or malformed message\r\n";
+            write(sockfd, errMsg.c_str(), errMsg.length());
+            close(sockfd);
+            return EXIT_FAILURE;
+        } 
+        
+        handleIncomingMessage(msg, ctx, sockfd);
+        if (ctx.state == ClientState::TERMINATED) {
+            close(sockfd);
+            return EXIT_FAILURE;
         }
     }
     
     // Main client loop - handle user input and server messages
+    fd_set readfds;
     bool waitingForReply = false;
-    auto replyDeadline = std::chrono::steady_clock::now();
+    time_t replyDeadline = 0;
 
     while (running) {
         // Handle graceful shutdown on SIGINT
         if (terminationRequested) {
             std::string byeMsg = serializeBye(ctx.displayName);
-            if (write(sockfd, byeMsg.c_str(), byeMsg.length()) < 0) {
-                perror("write error message");
-            }
+            write(sockfd, byeMsg.c_str(), byeMsg.length());
             break;
         }
         
-        // Calculate timeout for epoll_wait
-        int timeoutMs = 1000; // Default polling timeout: 1 second
+        FD_ZERO(&readfds);
+        FD_SET(sockfd, &readfds);
+        FD_SET(STDIN_FILENO, &readfds);
         
+        // Setup timeout for waiting for replies
+        struct timeval tv;
+        struct timeval* tv_ptr = nullptr;
         if (waitingForReply) {
-            auto now = std::chrono::steady_clock::now();
-            auto remainingMs = std::chrono::duration_cast<std::chrono::milliseconds>(replyDeadline - now).count();
-            
-            if (remainingMs <= 0) {
+            time_t now = time(nullptr);
+            if (now >= replyDeadline) {
                 std::cout << "ERROR: No REPLY received within 5 seconds.\n";
-                close(epoll_fd);
                 close(sockfd);
                 return EXIT_FAILURE;
+            } else {
+                tv.tv_sec = replyDeadline - now;
+                tv.tv_usec = 0;
+                tv_ptr = &tv;
             }
-            timeoutMs = std::min(1000, static_cast<int>(remainingMs));
         }
+
+        int max_fd = (sockfd > STDIN_FILENO) ? sockfd : STDIN_FILENO;
+        int activity = select(max_fd + 1, &readfds, NULL, NULL, tv_ptr);
         
-        epoll_event events[10];
-        int nfds = epoll_wait(epoll_fd, events, 10, timeoutMs);
-        
-        if (nfds == -1) {
+        if (activity < 0) {
             if (errno == EINTR) continue;
-            perror("epoll_wait failed");
+            perror("select");
             break;
+        } else if (activity == 0) {
+            std::cout << "ERROR: No REPLY within 5 seconds (timeout).\n";
+            close(sockfd);
+            return EXIT_FAILURE;
         }
         
-        // If we're waiting for reply and no events, check if we've timed out
-        if (nfds == 0 && waitingForReply) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - replyDeadline).count();
-            if (elapsedMs >= 0) {
-                std::cout << "ERROR: No REPLY within 5 seconds (timeout).\n";
-                close(epoll_fd);
-                close(sockfd);
-                return EXIT_FAILURE;
+        // Handle server messages
+        if (FD_ISSET(sockfd, &readfds)) {
+            ssize_t count = read(sockfd, buffer, sizeof(buffer) - 1);
+            if (count <= 0) {
+                if (count < 0) perror("read from socket");
+                else std::cout << "Server closed the connection.\n";
+                break;
             }
-            continue;
+            
+            buffer[count] = '\0';
+            std::string received(buffer, count);
+            ParsedMessage msg = parseMessage(received);
+
+            // Update reply waiting status
+            if (msg.type == MessageType::REPLY) {
+                waitingForReply = false;
+            }
+
+            // Validate message against FSM
+            if (msg.type == MessageType::UNKNOWN || !isValidTransition(ctx.state, msg.type)) {
+                std::cout << "ERROR: Protocol violation or malformed message from server.\n";
+                std::string errMsg = "ERR FROM " + ctx.displayName + " IS Protocol violation or malformed message\r\n";
+                write(sockfd, errMsg.c_str(), errMsg.length());
+                ctx.state = ClientState::TERMINATED;
+            } else {
+                handleIncomingMessage(msg, ctx, sockfd);
+            }
+            
+            if (ctx.state == ClientState::TERMINATED) {
+                break;
+            }
         }
         
-        for (int i = 0; i < nfds; i++) {
-            // Handle socket events
-            if (events[i].data.fd == sockfd) {
-                ssize_t count = read(sockfd, buffer, sizeof(buffer) - 1);
-                if (count <= 0) {
-                    if (count < 0) perror("read from socket");
-                    else std::cout << "Server closed the connection.\n";
-                    running = false;
-                    break;
-                }
-                
-                buffer[count] = '\0';
-                std::string received(buffer, count);
-                ParsedMessage msg = parseMessage(received);
-
-                // Update reply waiting status
-                if (msg.type == MessageType::REPLY) {
-                    waitingForReply = false;
-                }
-
-                // Validate message against FSM
-                if (msg.type == MessageType::UNKNOWN || !isValidTransition(ctx.state, msg.type)) {
-                    std::cout << "ERROR: Protocol violation or malformed message from server.\n";
-                    std::string errMsg = "ERR FROM " + ctx.displayName + " IS Protocol violation or malformed message\r\n";
-                    if (write(sockfd, errMsg.c_str(), errMsg.length()) < 0) {
-                        perror("write error message");
-                    }
-                    ctx.state = ClientState::TERMINATED;
-                } else {
-                    handleIncomingMessage(msg, ctx, sockfd);
-                }
-                
-                if (ctx.state == ClientState::TERMINATED) {
-                    running = false;
-                    break;
-                }
+        // Handle user input
+        if (FD_ISSET(STDIN_FILENO, &readfds)) {
+            std::string input;
+            if (!std::getline(std::cin, input) || input.empty()) {
+                continue;
             }
-            // Handle stdin events
-            else if (events[i].data.fd == STDIN_FILENO) {
-                char buf[1024];
-                ssize_t bytes = read(STDIN_FILENO, buf, sizeof(buf));
-                if (bytes > 0) {
-                    stdinBuffer.append(buf, bytes);
-                    size_t pos;
-                    while ((pos = stdinBuffer.find('\n')) != std::string::npos) {
-                        std::string line = stdinBuffer.substr(0, pos);
-                        stdinBuffer.erase(0, pos + 1);
-                        
-                        // Process user commands or messages
-                        if (line.empty()) continue;
-                        
-                        if (line[0] == '/') {
-                            std::istringstream iss(line.substr(1));
-                            std::string cmd;
-                            iss >> cmd;
-                            
-                            if (cmd == "join" && ctx.state == ClientState::JOINED) {
-                                std::string channelID;
-                                iss >> channelID;
-                                if (!channelID.empty()) {
-                                    ctx.channelID = channelID;
-                                    std::string joinMsg = serializeJoin(channelID, ctx.displayName);
-                                    std::cout << "Sending JOIN message:\n" << joinMsg;
-                                    if (write(sockfd, joinMsg.c_str(), joinMsg.length()) < 0) {
-                                        perror("write JOIN message");
-                                        break;
-                                    }
-                                    // Update state according to FSM
-                                    ctx.state = ClientState::JOIN_WAITING;
-                                    waitingForReply = true;
-                                    replyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-                                } else {
-                                    std::cout << "Error: Channel name cannot be empty\n";
-                                    std::cout << "Usage: /join <channel>\n"; 
-                                }
-                            } 
-                            else if (cmd == "auth") {
-                                std::string newUsername, newSecret, newDisplayName;
-                                iss >> newUsername >> newSecret >> newDisplayName;
-                                if (newUsername.empty() || newSecret.empty() || newDisplayName.empty()) {
-                                    std::cout << "Usage: /auth <username> <secret> <displayName>\n";
-                                } else {
-                                    ctx.username = newUsername;
-                                    ctx.displayName = newDisplayName;
-                                    std::string authMsg = serializeAuth(newUsername, newDisplayName, newSecret);
-                                    if (write(sockfd, authMsg.c_str(), authMsg.length()) < 0) {
-                                        perror("write AUTH message");
-                                        break;
-                                    }
-                                    // Update state according to FSM
-                                    ctx.state = ClientState::AUTHENTICATING;
-                                    waitingForReply = true;
-                                    replyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-                                }
-                            }
-                            else if (cmd == "rename") {
-                                std::string newDisplayName;
-                                iss >> newDisplayName;
-                                if (!newDisplayName.empty()) {
-                                    ctx.displayName = newDisplayName;
-                                    std::cout << "Display name updated to: " << newDisplayName << "\n";
-                                } else {
-                                    std::cout << "Usage: /rename <displayName>\n";
-                                }
-                            } 
-                            else if (cmd == "bye") {
-                                std::string byeMsg = serializeBye(ctx.displayName);
-                                if (write(sockfd, byeMsg.c_str(), byeMsg.length()) < 0) {
-                                    perror("write error message");
-                                }
-                                running = false;
-                                break;
-                            } 
-                            else if (cmd == "help") {
-                                std::cout << "Available commands:\n";
-                                std::cout << "  /join <channel>       - Join a channel\n";
-                                std::cout << "  /auth <u> <s> <d>     - Re-authenticate with new credentials\n";
-                                std::cout << "  /rename <displayName> - Change display name locally\n";
-                                std::cout << "  /bye                  - Disconnect from server\n";
-                                std::cout << "  /help                 - Show this help\n";
-                            } 
-                            else {
-                                std::cout << "Unknown command. Type /help for available commands.\n";
-                            }
-                        } 
-                        else if (ctx.state == ClientState::JOINED) {
-                            const size_t MAX_MSG_LEN = 60000;
-                            if (line.size() > MAX_MSG_LEN) {
-                                std::cout << "Message truncated to " << MAX_MSG_LEN << " characters.\n";
-                                line = line.substr(0, MAX_MSG_LEN);
-                            }
-                            std::string msgContent = serializeMsg(ctx.displayName, line);
-                            if (write(sockfd, msgContent.c_str(), msgContent.length()) < 0) {
-                                perror("write MSG message");
-                                break;
-                            }
-                        } 
-                        else {
-                            std::cout << "You must join a channel before sending messages.\n";
-                            std::cout << "Use /join <channel> to join a channel.\n";
+            
+            // Process user commands (starting with /)
+            if (input[0] == '/') {
+                std::istringstream iss(input.substr(1));
+                std::string cmd;
+                iss >> cmd;
+                
+                // JOIN command - FSM transition from open→join
+                if (cmd == "join" && ctx.state == ClientState::JOINED) {
+                    std::string channelID;
+                    iss >> channelID;
+                    if (!channelID.empty()) {
+                        ctx.channelID = channelID;
+                        std::string joinMsg = serializeJoin(channelID, ctx.displayName);
+                        std::cout << "Sending JOIN message:\n" << joinMsg;
+                        if (write(sockfd, joinMsg.c_str(), joinMsg.length()) < 0) {
+                            perror("write JOIN message");
+                            break;
                         }
+                        // Update state according to FSM
+                        ctx.state = ClientState::JOIN_WAITING;
+                        waitingForReply = true;
+                        replyDeadline = time(nullptr) + 5; // 5-second timeout
+                    } else {
+                        std::cout << "Error: Channel name cannot be empty\n";
+                        std::cout << "Usage: /join <channel>\n"; 
+                    }
+                } 
+                // AUTH command - support re-authentication
+                else if (cmd == "auth") {
+                    std::string newUsername, newSecret, newDisplayName;
+                    iss >> newUsername >> newSecret >> newDisplayName;
+                    if (newUsername.empty() || newSecret.empty() || newDisplayName.empty()) {
+                        std::cout << "Usage: /auth <username> <secret> <displayName>\n";
+                    } else {
+                        ctx.username = newUsername;
+                        ctx.displayName = newDisplayName;
+                        std::string authMsg = serializeAuth(newUsername, newDisplayName, newSecret);
+                        if (write(sockfd, authMsg.c_str(), authMsg.length()) < 0) {
+                            perror("write AUTH message");
+                            break;
+                        }
+                        // Update state according to FSM
+                        ctx.state = ClientState::AUTHENTICATING;
+                        waitingForReply = true;
+                        replyDeadline = time(nullptr) + 5;
                     }
                 }
-                else if (bytes == 0) {
-                    // EOF on stdin, exit gracefully
-                    std::string byeMsg = serializeBye(ctx.displayName);
-                    if (write(sockfd, byeMsg.c_str(), byeMsg.length()) < 0) {
-                        perror("write BYE message");
+                // Local rename command (client-side only)
+                else if (cmd == "rename") {
+                    std::string newDisplayName;
+                    iss >> newDisplayName;
+                    if (!newDisplayName.empty()) {
+                        ctx.displayName = newDisplayName;
+                        std::cout << "Display name updated to: " << newDisplayName << "\n";
+                    } else {
+                        std::cout << "Usage: /rename <displayName>\n";
                     }
-                    running = false;
+                } 
+                // BYE command - terminate connection
+                else if (cmd == "bye") {
+                    std::string byeMsg = serializeBye(ctx.displayName);
+                    write(sockfd, byeMsg.c_str(), byeMsg.length());
+                    break;
+                } 
+                // Help command
+                else if (cmd == "help") {
+                    std::cout << "Available commands:\n";
+                    std::cout << "  /join <channel>       - Join a channel\n";
+                    std::cout << "  /auth <u> <s> <d>     - Re-authenticate with new credentials\n";
+                    std::cout << "  /rename <displayName> - Change display name locally\n";
+                    std::cout << "  /bye                  - Disconnect from server\n";
+                    std::cout << "  /help                 - Show this help\n";
+                } 
+                else {
+                    std::cout << "Unknown command. Type /help for available commands.\n";
+                }
+            } 
+            // Regular message - send to channel if in JOINED state
+            else if (ctx.state == ClientState::JOINED) {
+                const size_t MAX_MSG_LEN = 60000;
+                if (input.size() > MAX_MSG_LEN) {
+                    std::cout << "Message truncated to " << MAX_MSG_LEN << " characters.\n";
+                    input = input.substr(0, MAX_MSG_LEN);
+                }
+                std::string msgContent = serializeMsg(ctx.displayName, input);
+                if (write(sockfd, msgContent.c_str(), msgContent.length()) < 0) {
+                    perror("write MSG message");
                     break;
                 }
+            } 
+            // Not in JOINED state
+            else {
+                std::cout << "You must join a channel before sending messages.\n";
+                std::cout << "Use /join <channel> to join a channel.\n";
             }
         }
     }
     
-    close(epoll_fd);
     close(sockfd);
     return EXIT_SUCCESS;
 }

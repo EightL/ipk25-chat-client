@@ -1,5 +1,8 @@
 # CHANGELOG
 
+## 03-04-2025
+- cannot join cannot type
+
 ## 29-03-2025
 ### Added
 - Implemented graceful termination on SIGINT by sending a BYE message.
