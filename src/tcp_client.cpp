@@ -83,7 +83,7 @@ int TcpClient::run() {
     // Resolve server address
     std::vector<std::string> ip_addresses = resolveHostname(serverAddress, true, serverPort);
     if (ip_addresses.empty()) {
-        std::cerr << "Could not resolve any address for host: " << serverAddress << std::endl;
+        std::cout << "ERROR: Could not resolve any address for host: " << serverAddress << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -91,7 +91,7 @@ int TcpClient::run() {
     int sockfd = -1;
     bool connected = false;
     for (const auto& ip : ip_addresses) {
-        std::cout << "Trying to connect to " << ip << " on port " << serverPort << "..." << std::endl;
+        std::cerr << "Trying to connect to " << ip << " on port " << serverPort << "..." << std::endl;
         
         sockfd = socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
@@ -122,7 +122,7 @@ int TcpClient::run() {
     }
 
     if (!connected) {
-        std::cerr << "Could not connect to any resolved address." << std::endl;
+        std::cout << "ERROR: Could not connect to any resolved address." << std::endl;
         return EXIT_FAILURE;
     }
 

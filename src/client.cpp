@@ -256,7 +256,7 @@ void Client::processUserInput(const std::string& input) {
             std::string newDisplayName;
             iss >> newDisplayName;
             if (newDisplayName.empty()) {
-                std::cout << "Usage: /rename <displayName>" << std::endl;
+                std::cerr << "Usage: /rename <displayName>" << std::endl;
                 return;
             }
             
@@ -267,7 +267,7 @@ void Client::processUserInput(const std::string& input) {
             }
             
             displayName = newDisplayName;
-            std::cout << "Display name updated to: " << newDisplayName << std::endl;
+            std::cerr << "Display name updated to: " << newDisplayName << std::endl;
         }
         else if (cmd == "bye") {
             sendByeMessage();

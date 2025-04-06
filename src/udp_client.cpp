@@ -137,7 +137,7 @@ bool UdpClient::authenticateWithRetries(const std::string& secret) {
     
     bool success = sendUdpMessage(authMsg, true);
     if (!success) {
-        std::cerr << "ERROR: Authentication failed: couldn't get confirmation" << std::endl;
+        std::cout << "ERROR: Authentication failed: couldn't get confirmation" << std::endl;
         return false;
     }
     
@@ -150,7 +150,7 @@ bool UdpClient::authenticateWithRetries(const std::string& secret) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
         
         if (elapsed >= 5000) {
-            std::cerr << "ERROR: Authentication failed: no REPLY received within 5 seconds" << std::endl;
+            std::cout << "ERROR: Authentication failed: no REPLY received within 5 seconds" << std::endl;
             return false;
         }
         
@@ -259,7 +259,7 @@ int UdpClient::run() {
     // Resolve hostname to IP
     std::vector<std::string> ip_addresses = Client::resolveHostname(serverAddress, false);
     if (ip_addresses.empty()) {
-        std::cerr << "Could not resolve any address for host: " << serverAddress << std::endl;
+        std::cout << "ERROR: Could not resolve any address for host: " << serverAddress << std::endl;
         return EXIT_FAILURE;
     }
     
@@ -292,7 +292,7 @@ int UdpClient::run() {
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port = htons(serverPort);
     if (inet_pton(AF_INET, serverIP.c_str(), &serverAddr.sin_addr) <= 0) {
-        std::cerr << "Invalid server address: " << serverIP << std::endl;
+        std::cout << "ERROR: Invalid server address: " << serverIP << std::endl;
         close(socketFd);
         return EXIT_FAILURE;
     }
