@@ -35,104 +35,31 @@ bool TcpClient::sendMessage(const std::string& msg) {
     return true;
 }
 
-void TcpClient::processUserInput(const std::string& line) {
-    if (line.empty()) return;
-    
-    if (line[0] == '/') { // Command
-        std::istringstream iss(line.substr(1));
-        std::string cmd;
-        iss >> cmd;
-        
-        if (cmd == "join" && state == ClientState::JOINED) {
-            std::string channelId;
-            iss >> channelId;
-            if (!channelId.empty()) {
-                channelID = channelId;
-                std::string joinMsg = serializeJoin(channelId, displayName);
-                std::cout << "Sending JOIN message:\n" << joinMsg;
-                if (!sendMessage(joinMsg)) {
-                    return;
-                }
-                state = ClientState::JOIN_WAITING;
-            } else {
-                std::cout << "Error: Channel name cannot be empty\n";
-                std::cout << "Usage: /join <channel>\n"; 
-            }
-        } 
-        else if (cmd == "auth") {
-            std::string newUsername, newSecret, newDisplayName;
-            iss >> newUsername >> newSecret >> newDisplayName;
-            if (newUsername.empty() || newSecret.empty() || newDisplayName.empty()) {
-                std::cout << "Usage: /auth <username> <secret> <displayName>\n";
-            } else {
-                username = newUsername;
-                displayName = newDisplayName;
-                std::string authMsg = serializeAuth(newUsername, newDisplayName, newSecret);
-                if (!sendMessage(authMsg)) {
-                    return;
-                }
-                state = ClientState::AUTHENTICATING;
-            }
-        }
-        else if (cmd == "rename") {
-            std::string newDisplayName;
-            iss >> newDisplayName;
-            if (!newDisplayName.empty()) {
-                displayName = newDisplayName;
-                std::cout << "Display name updated to: " << newDisplayName << "\n";
-            } else {
-                std::cout << "Usage: /rename <displayName>\n";
-            }
-        } 
-        else if (cmd == "bye") {
-            std::string byeMsg = serializeBye(displayName);
-            sendMessage(byeMsg);
-        } 
-        else if (cmd == "help") {
-            std::cout << "Available commands:\n";
-            std::cout << "  /join <channel>       - Join a channel\n";
-            std::cout << "  /auth <u> <s> <d>     - Re-authenticate with new credentials\n";
-            std::cout << "  /rename <displayName> - Change display name locally\n";
-            std::cout << "  /bye                  - Disconnect from server\n";
-            std::cout << "  /help                 - Show this help\n";
-        } 
-        else {
-            std::cout << "Unknown command. Type /help for available commands.\n";
-        }
-    } 
-    else if (state == ClientState::JOINED) {
-        const size_t MAX_MSG_LEN = 60000;
-        std::string truncatedLine = line;
-        if (truncatedLine.size() > MAX_MSG_LEN) {
-            std::cout << "Message truncated to " << MAX_MSG_LEN << " characters.\n";
-            truncatedLine = truncatedLine.substr(0, MAX_MSG_LEN);
-        }
-        std::string msgContent = serializeMsg(displayName, truncatedLine);
-        sendMessage(msgContent);
-    } 
-    else {
-        std::cout << "You must join a channel before sending messages.\n";
-        std::cout << "Use /join <channel> to join a channel.\n";
-    }
+bool TcpClient::authenticate(const std::string& secret) {
+    std::string authMsg = serializeAuth(username, displayName, secret);
+    return sendMessage(authMsg);
 }
 
-bool TcpClient::waitForReply(int timeoutSec) {
-    fd_set readfds;
-    struct timeval tv;
-    
-    FD_ZERO(&readfds);
-    FD_SET(socketFd, &readfds);
-    
-    tv.tv_sec = timeoutSec;
-    tv.tv_usec = 0;
-    
-    int result = select(socketFd + 1, &readfds, NULL, NULL, &tv);
-    
-    if (result > 0 && FD_ISSET(socketFd, &readfds)) {
+bool TcpClient::joinChannel(const std::string& channelId) {
+    std::string joinMsg = serializeJoin(channelId, displayName);
+    printf_debug("Sending JOIN message: %s", joinMsg.c_str());
+    return sendMessage(joinMsg);
+}
+
+bool TcpClient::sendChatMessage(const std::string& message) {
+    std::string msgContent = serializeMsg(displayName, message);
+    return sendMessage(msgContent);
+}
+
+bool TcpClient::sendByeMessage() {
+    std::string byeMsg = serializeBye(displayName);
+    if (sendMessage(byeMsg)) {
+        state = ClientState::TERMINATED;
         return true;
     }
     return false;
 }
+
 
 void TcpClient::handleIncomingMessage(const ParsedMessage& msg) {
     // Call base class implementation
@@ -154,32 +81,37 @@ int TcpClient::run() {
     hints.ai_flags = AI_ADDRCONFIG;
 
     // Resolve server address
-    std::string port_str = std::to_string(serverPort);
-    struct addrinfo* result;
-    int s = getaddrinfo(serverAddress.c_str(), port_str.c_str(), &hints, &result);
-    if (s != 0) {
-        std::cerr << "getaddrinfo: " << gai_strerror(s) << std::endl;
+    std::vector<std::string> ip_addresses = resolveHostname(serverAddress, true, serverPort);
+    if (ip_addresses.empty()) {
+        std::cerr << "Could not resolve any address for host: " << serverAddress << std::endl;
         return EXIT_FAILURE;
     }
 
     // Try each address until we successfully connect
     int sockfd = -1;
-    struct addrinfo* rp;
     bool connected = false;
-    for (rp = result; rp != NULL; rp = rp->ai_next) {
-        char ip_str[INET_ADDRSTRLEN];
-        struct sockaddr_in* addr_in = (struct sockaddr_in*)rp->ai_addr;
-        inet_ntop(AF_INET, &(addr_in->sin_addr), ip_str, INET_ADDRSTRLEN);
-        std::cout << "Trying to connect to " << ip_str << " on port " << serverPort << "..." << std::endl;
+    for (const auto& ip : ip_addresses) {
+        std::cout << "Trying to connect to " << ip << " on port " << serverPort << "..." << std::endl;
         
-        sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        sockfd = socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             perror("socket");
             continue;
         }
         
-        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0) {
-            std::cout << "Connected to " << ip_str << std::endl;
+        struct sockaddr_in server_addr;
+        std::memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(serverPort);
+        if (inet_pton(AF_INET, ip.c_str(), &server_addr.sin_addr) <= 0) {
+            perror("inet_pton");
+            close(sockfd);
+            sockfd = -1;
+            continue;
+        }
+        
+        if (connect(sockfd, reinterpret_cast<struct sockaddr*>(&server_addr), sizeof(server_addr)) == 0) {
+            std::cout << "Connected to " << ip << std::endl;
             connected = true;
             break;
         } else {
@@ -188,7 +120,6 @@ int TcpClient::run() {
             sockfd = -1;
         }
     }
-    freeaddrinfo(result);
 
     if (!connected) {
         std::cerr << "Could not connect to any resolved address." << std::endl;
@@ -322,7 +253,7 @@ int TcpClient::run() {
                     while ((pos = stdinBuffer.find('\n')) != std::string::npos) {
                         std::string line = stdinBuffer.substr(0, pos);
                         stdinBuffer.erase(0, pos + 1);
-                        processUserInput(line);
+                        Client::processUserInput(line);
                     }
                 }
                 else if (bytes == 0) {

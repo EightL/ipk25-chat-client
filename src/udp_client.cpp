@@ -209,121 +209,44 @@ bool UdpClient::authenticateWithRetries(const std::string& secret) {
     return false;
 }
 
-void UdpClient::processUserInput(const std::string& input) {
-    if (input.empty()) return;
+bool UdpClient::authenticate(const std::string& secret) {
+    return authenticateWithRetries(secret);
+}
+
+bool UdpClient::joinChannel(const std::string& channelId) {
+    uint16_t joinMsgId = getNextMsgId();
+    std::vector<char> joinMsg = buildUdpJoinMessage(joinMsgId, channelId, displayName);
     
-    if (input[0] == '/') { // Command
-        std::istringstream iss(input.substr(1));
-        std::string cmd;
-        iss >> cmd;
-        
-        if (cmd == "auth") {
-            if (state == ClientState::JOINED || state == ClientState::JOIN_WAITING) {
-                std::cout << "ERROR: Already authenticated." << std::endl;
-                return;
-            }
-            std::string newUsername, newSecret, newDisplayName;
-            iss >> newUsername >> newSecret >> newDisplayName;
-            
-            if (newUsername.empty() || newSecret.empty() || newDisplayName.empty()) {
-                std::cout << "ERROR: Invalid authentication parameters" << std::endl;
-                std::cerr << "Usage: /auth <username> <secret> <displayName>" << std::endl;
-                return;
-            }
-            
-            username = newUsername;
-            displayName = newDisplayName;
-            
-            // Store the current state to restore if authentication fails
-            ClientState previousState = state;
-            
-            // Perform authentication
-            state = ClientState::AUTHENTICATING;
-            if (!authenticateWithRetries(newSecret)) {
-                printf_debug("Authentication failed");
-                // Restore previous state if we were already authenticated
-                if (previousState == ClientState::JOINED || previousState == ClientState::JOIN_WAITING) {
-                    printf_debug("Restoring previous client state");
-                    state = previousState;
-                } else {
-                    state = ClientState::INIT;
-                }
-            }
-        }
-        else if (cmd == "join" && state == ClientState::JOINED) {
-            std::string channelId;
-            iss >> channelId;
-            if (!channelId.empty()) {
-                channelID = channelId;
-                uint16_t joinMsgId = getNextMsgId();
-                std::vector<char> joinMsg = buildUdpJoinMessage(joinMsgId, channelId, displayName);
-                
-                // Send JOIN message
-                if (sendUdpMessage(joinMsg)) {
-                    state = ClientState::JOIN_WAITING;
-                    printf_debug("Sent JOIN request for channel: %s", channelId.c_str());
-                } else {
-                    printf_debug("Failed to send JOIN request.");
-                }
-            } else {
-                std::cout << "ERROR: Channel name cannot be empty" << std::endl;
-                std::cerr << "Usage: /join <channel>" << std::endl;
-            }
-        }
-        else if (cmd == "bye") {
-            // Send BYE message
-            uint16_t byeMsgId = getNextMsgId();
-            std::vector<char> byeMsg = buildUdpByeMessage(byeMsgId, displayName);
-            
-            // Use sendUdpMessage with confirmation to ensure the BYE is received
-            if (sendUdpMessage(byeMsg, true)) {
-                printf_debug("BYE message confirmed by server");
-            } else {
-                printf_debug("Failed to get confirmation for BYE message");
-            }
-            state = ClientState::TERMINATED;
-        }
-        else if (cmd == "rename") {
-            std::string newDisplayName;
-            iss >> newDisplayName;
-            if (!newDisplayName.empty()) {
-                displayName = newDisplayName;
-                printf_debug("Display name updated to: %s", newDisplayName.c_str());
-            } else {
-                std::cout << "Usage: /rename <displayName>" << std::endl;
-            }
-        }
-        else if (cmd == "help") {
-            printf_debug("Displaying available commands");
-            std::cerr << "Available commands:" << std::endl;
-            std::cerr << "  /auth <u> <s> <d>     - Authenticate with username, secret and display name" << std::endl;
-            std::cerr << "  /join <channel>       - Join a channel" << std::endl;
-            std::cerr << "  /rename <displayName> - Change display name locally" << std::endl;
-            std::cerr << "  /bye                  - Disconnect from server" << std::endl;
-            std::cerr << "  /help                 - Show this help" << std::endl;
-        }
-        else {
-            std::cerr << "Unknown command. Type /help for available commands." << std::endl;
-        }
+    if (sendUdpMessage(joinMsg)) {
+        printf_debug("Sent JOIN request for channel: %s", channelId.c_str());
+        return true;
+    } else {
+        printf_debug("Failed to send JOIN request.");
+        return false;
     }
-    else if (state == ClientState::JOINED) {
-        // Send chat message
-        const size_t MAX_MSG_LEN = 60000;
-        std::string line = input;
-        if (line.size() > MAX_MSG_LEN) {
-            std::cout << "ERROR: Message truncated to " << MAX_MSG_LEN << " characters." << std::endl;
-            line = line.substr(0, MAX_MSG_LEN);
-        }
-        
-        uint16_t msgId = getNextMsgId();
-        std::vector<char> msgData = buildUdpMsgMessage(msgId, displayName, line);
-        if (!sendUdpMessage(msgData)) {
-            printf_debug("Failed to send message");
-        }
+}
+
+bool UdpClient::sendChatMessage(const std::string& message) {
+    uint16_t msgId = getNextMsgId();
+    std::vector<char> msgData = buildUdpMsgMessage(msgId, displayName, message);
+    if (!sendUdpMessage(msgData)) {
+        printf_debug("Failed to send message");
+        return false;
     }
-    else {
-        std::cerr << "You must join a channel before sending messages." << std::endl;
-        std::cerr << "Use /join <channel> to join a channel." << std::endl;
+    return true;
+}
+
+bool UdpClient::sendByeMessage() {
+    uint16_t byeMsgId = getNextMsgId();
+    std::vector<char> byeMsg = buildUdpByeMessage(byeMsgId, displayName);
+    
+    if (sendUdpMessage(byeMsg, true)) {
+        printf_debug("BYE message confirmed by server");
+        state = ClientState::TERMINATED;
+        return true;
+    } else {
+        printf_debug("Failed to get confirmation for BYE message");
+        return false;
     }
 }
 
@@ -332,29 +255,16 @@ void UdpClient::handleIncomingMessage(const ParsedMessage& msg) {
     Client::handleIncomingMessage(msg);
 }
 
-std::string resolveHostname(const std::string& hostname) {
-    struct addrinfo hints, *result;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;     // Only IPv4
-    hints.ai_socktype = SOCK_DGRAM; // UDP socket
-    
-    int status = getaddrinfo(hostname.c_str(), NULL, &hints, &result);
-    if (status != 0) {
-        std::cerr << "Failed to resolve hostname: " << gai_strerror(status) << std::endl;
-        return "";
+int UdpClient::run() {
+    // Resolve hostname to IP
+    std::vector<std::string> ip_addresses = Client::resolveHostname(serverAddress, false);
+    if (ip_addresses.empty()) {
+        std::cerr << "Could not resolve any address for host: " << serverAddress << std::endl;
+        return EXIT_FAILURE;
     }
     
-    char ipstr[INET_ADDRSTRLEN];
-    struct sockaddr_in *ipv4 = reinterpret_cast<struct sockaddr_in *>(result->ai_addr);
-    inet_ntop(AF_INET, &(ipv4->sin_addr), ipstr, sizeof(ipstr));
-    freeaddrinfo(result);
-    return std::string(ipstr);
-}
-
-int UdpClient::run() {
-    // Resolve hostname to IP if needed
-    std::string resolvedIP = resolveHostname(serverAddress);
-    std::string serverIP = resolvedIP.empty() ? serverAddress : resolvedIP;
+    // Use the first resolved IP
+    std::string serverIP = ip_addresses[0];
     
     // Create UDP socket
     socketFd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -507,7 +417,7 @@ int UdpClient::run() {
                         stdinBuffer.erase(0, pos + 1);
                         
                         // Process user input
-                        processUserInput(line);
+                        Client::processUserInput(line);
                         
                         if (state == ClientState::TERMINATED) {
                             running = false;

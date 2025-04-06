@@ -3,6 +3,7 @@
 
 #include <string>
 #include <set>
+#include <sstream>
 #include "message.h"
 
 // Client states - aligned with Finite State Machine diagram
@@ -32,12 +33,20 @@ protected:
     // Handle incoming messages according to FSM
     virtual void handleIncomingMessage(const ParsedMessage& msg);
     
+    std::vector<std::string> resolveHostname(const std::string& hostname, bool isTcp, int port = 0);
+
+    // Common command processing - Template Method
+    void processUserInput(const std::string& input);
+    
+    // Protocol-specific abstract methods to be implemented by subclasses
+    virtual bool authenticate(const std::string& secret) = 0;
+    virtual bool joinChannel(const std::string& channelId) = 0;
+    virtual bool sendChatMessage(const std::string& message) = 0;
+    virtual bool sendByeMessage() = 0;
+    
 public:
     Client(bool isUdpClient);
     virtual ~Client();
-    
-    // Set user credentials
-    void setCredentials(const std::string& user, const std::string& display, const std::string& secret);
     
     // Main client loop
     virtual int run() = 0;
