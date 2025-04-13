@@ -1,23 +1,25 @@
-# Compiler and flags
-CXX := g++ -DDEBUG_PRINT
+CXX := g++ 
 CXXFLAGS := -std=c++20 -Wall -Wextra -Werror -pedantic
-LDFLAGS := 
+LDFLAGS :=
+
+# Debug flags - use make debug to build with debug prints
+DEBUGFLAGS := -DDEBUG_PRINT
 
 # Project files
 SRCS := main.cpp client.cpp message.cpp tcp_client.cpp udp_client.cpp
 OBJS := $(SRCS:.cpp=.o)
-TARGET := ipk25-chat
+TARGET := ipk25chat-client
 
 # Default target
 all: $(TARGET)
 
+# Debug build
+debug: CXXFLAGS += $(DEBUGFLAGS)
+debug: $(TARGET)
+
 # Build target
 $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-
-# Compile source files
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # Clean build artifacts
 clean:
