@@ -30,11 +30,11 @@
      int serverPort;                         ///< Server port number
      uint16_t timeoutMs;                     ///< Timeout for message retransmissions in milliseconds
      uint8_t maxRetransmissions;             ///< Maximum number of retransmission attempts
-     
+     bool fatalError = false;                ///< Flag for fatal errors
      uint16_t nextMsgId = 0;                 ///< Next message ID to use
      std::set<uint16_t> seenMsgIds;          ///< Set of already processed message IDs to avoid duplicates
      sockaddr_in serverAddr;                 ///< Server socket address structure
-     
+     std::chrono::steady_clock::time_point closingDeadline; ///< Deadline for termination sequence
      std::chrono::steady_clock::time_point terminationStartTime; ///< Timestamp when graceful termination began
      bool isWaitingForTermination = false;   ///< Whether client is waiting for termination to complete
      
@@ -128,6 +128,17 @@
       */
      virtual bool sendByeMessage() override;
      
+    /**
+     * @brief Waits for a REPLY message with a specified reference ID
+     *
+     * Waits up to 5 seconds for a REPLY message matching the expected reference ID.
+     * Handles and confirms other messages received during the wait.
+     *
+     * @param expectedRefId The message ID to match in the REPLY's refMsgId field
+     * @return true if a successful REPLY is received, false otherwise
+     */
+    bool awaitReply(uint16_t expectedRefId);
+
  public:
      /**
       * @brief Constructs a UDP client
@@ -156,6 +167,13 @@
       * @return EXIT_SUCCESS on successful termination, EXIT_FAILURE on error
       */
      virtual int run() override;
+
+     /**
+      * @brief Sends a protocol error message to the server
+      *
+      * @param errorMessage The error message content
+      */
+     void sendProtocolError(const std::string& errorMessage) override;
  };
  
  #endif // UDP_CLIENT_H

@@ -168,6 +168,17 @@
   */
  std::vector<char> createUdpConfirmMessage(uint16_t refMsgId);
  
+
+/**
+ * @brief Creates an ERR message in UDP binary format
+ *
+ * @param msgId Message identifier
+ * @param displayName User's display name
+ * @param text Error message text
+ * @return Binary message as a vector of bytes
+ */
+std::vector<char> createUdpErrMessage(uint16_t msgId, const std::string& displayName, const std::string& text);
+
  /**
   * @brief Parses a UDP binary message into a structured format
   *

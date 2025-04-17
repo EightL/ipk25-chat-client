@@ -81,6 +81,15 @@
       * @return true if the BYE message was sent successfully, false otherwise
       */
      virtual bool sendByeMessage() override;
+
+     /**
+      * @brief Sends a protocol error message to the server
+      *
+      * Transmits an error message over the established TCP connection.
+      *
+      * @param errorMessage The error message to send
+      */
+     virtual void sendProtocolError(const std::string& errorMessage) override;
      
  public:
      /**

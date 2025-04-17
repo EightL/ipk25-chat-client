@@ -63,6 +63,13 @@
       */
      void setNonBlocking(int fd);
      
+    // Add to protected section
+    bool validateInbound(const ParsedMessage& msg) const;
+
+
+    // Also add a helper method for sending errors
+    
+
      /**
       * @brief Verifies if a message type is valid for the current state
       *
@@ -185,6 +192,8 @@
       * @param display The display name for messages
       */
      void setIdentity(const std::string& user, const std::string& display);
+
+     virtual void sendProtocolError(const std::string& errorMessage) = 0;
  };
  
  #endif // CLIENT_H

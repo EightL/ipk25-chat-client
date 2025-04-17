@@ -19,6 +19,10 @@
  #include <netdb.h>
  #include "debug.h"
  
+ static constexpr size_t MAX_MSG_CONTENT = 60000;
+ static constexpr size_t MAX_DISPLAY_NAME = 20;
+ static constexpr size_t MAX_CHANNEL_ID = 20;
+
  // Initialize the client with the specified protocol type
  Client::Client(bool isUdpClient) : isUdp(isUdpClient) {
      state = ClientState::INIT;
@@ -45,6 +49,59 @@
      }
  }
  
+
+// Validate inbound message against protocol field size limits
+bool Client::validateInbound(const ParsedMessage& msg) const {
+    // Check message type and validate relevant fields
+    switch (msg.type) {
+        case MessageType::MSG:
+            // Check display name and message content
+            if (msg.param1.size() > MAX_DISPLAY_NAME) {
+                printf_debug("Inbound MSG has display name too long: %zu bytes", msg.param1.size());
+                return false;
+            }
+            if (msg.param2.size() > MAX_MSG_CONTENT) {
+                printf_debug("Inbound MSG has content too long: %zu bytes", msg.param2.size());
+                return false;
+            }
+            break;
+            
+        case MessageType::ERR:
+            // Check source and error message
+            if (msg.param1.size() > MAX_DISPLAY_NAME) {
+                printf_debug("Inbound ERR has source name too long: %zu bytes", msg.param1.size());
+                return false;
+            }
+            if (msg.param2.size() > MAX_MSG_CONTENT) {
+                printf_debug("Inbound ERR has content too long: %zu bytes", msg.param2.size());
+                return false;
+            }
+            break;
+            
+        case MessageType::REPLY:
+            // Check reply message
+            if (msg.param2.size() > MAX_MSG_CONTENT) {
+                printf_debug("Inbound REPLY has content too long: %zu bytes", msg.param2.size());
+                return false;
+            }
+            break;
+            
+        case MessageType::BYE:
+            // Check display name
+            if (msg.param1.size() > MAX_DISPLAY_NAME) {
+                printf_debug("Inbound BYE has display name too long: %zu bytes", msg.param1.size());
+                return false;
+            }
+            break;
+            
+        default:
+            // Don't validate other message types
+            break;
+    }
+    
+    return true;
+}
+
  // Resolve hostname to list of IP addresses using the appropriate socket type
  std::vector<std::string> Client::resolveHostname(const std::string& hostname, bool isTcp, int port) {
      struct addrinfo hints, *result, *rp;
@@ -268,11 +325,10 @@
              }
              
              channelID = channelId;
-             if (joinChannel(channelId)) {
-                 state = ClientState::JOIN_WAITING;
-             } else {
-                 std::cout << "ERROR: Failed to send join request" << std::endl;
-             }
+             state = ClientState::JOIN_WAITING;   // set *before* the request
+             if (!joinChannel(channelId)) {       // if the REPLY is NOK, handleIncomingMessage
+                 state = ClientState::JOINED;     //     will leave the state unchanged;
+             }  
          }
          else if (cmd == "rename") {
              // Handle rename command
@@ -297,15 +353,15 @@
          }
          else if (cmd == "help") {
              // Show help message
-             std::cerr << "Available commands:" << std::endl;
-             std::cerr << "  /auth <u> <s> <d>     - Authenticate with username, secret and display name" << std::endl;
-             std::cerr << "  /join <channel>       - Join a channel" << std::endl;
-             std::cerr << "  /rename <displayName> - Change display name locally" << std::endl;
-             std::cerr << "  /bye                  - Disconnect from server" << std::endl;
-             std::cerr << "  /help                 - Show this help" << std::endl;
+             std::cout << "Available commands:" << std::endl;
+             std::cout << "  /auth <u> <s> <d>     - Authenticate with username, secret and display name" << std::endl;
+             std::cout << "  /join <channel>       - Join a channel" << std::endl;
+             std::cout << "  /rename <displayName> - Change display name locally" << std::endl;
+             std::cout << "  /bye                  - Disconnect from server" << std::endl;
+             std::cout << "  /help                 - Show this help" << std::endl;
          }
          else {
-             std::cerr << "Unknown command. Type /help for available commands." << std::endl;
+             std::cout << "ERROR: Unknown command. Type /help for available commands." << std::endl;
          }
      }
      // Handle normal chat message (when in JOINED state)
@@ -326,22 +382,39 @@
          sendChatMessage(message);
      }
      else {
-         std::cerr << "You must join a channel before sending messages." << std::endl;
-         std::cerr << "Use /join <channel> to join a channel." << std::endl;
-     }
+        if (state == ClientState::INIT) {
+            std::cout << "ERROR: You must authenticate first." << std::endl;
+        } else {
+            std::cout << "ERROR: You must join a channel before sending messages." << std::endl;
+        }     }
  }
  
  // Process incoming messages and update client state
  void Client::handleIncomingMessage(const ParsedMessage& msg) {
+     // Validate message length before processing
+     if (!validateInbound(msg)) {
+         std::cout << "ERROR: Received message exceeds allowed length limits\n";
+         
+         // Send ERR back to server
+         sendProtocolError("Message exceeds allowed length limits");
+         
+         // Terminate client
+         printf_debug("Setting state to TERMINATED due to protocol violation");
+         state = ClientState::TERMINATED;
+         return;
+     }
+     
+     // Original message handling code follows...
      switch (msg.type) {
          case MessageType::REPLY:
              // Handle replies based on current state
              if (state == ClientState::JOIN_WAITING) {
-                 state = ClientState::JOINED;
                  if (msg.success) {
                      std::cout << "Action Success: " << msg.param2 << "\n";
+                     state = ClientState::JOINED;
                  } else {
                      std::cout << "Action Failure: " << msg.param2 << "\n";
+                     state = ClientState::JOINED; // Return to JOINED state on failure
                  }
              } else if (state == ClientState::AUTHENTICATING) {
                  if (msg.success) {
@@ -349,6 +422,7 @@
                      state = ClientState::JOINED;
                  } else {
                      std::cout << "Action Failure: " << msg.param2 << "\n";
+                     state = ClientState::INIT; // Return to INIT state on auth failure
                  }
              } else {
                  if (msg.success) {

@@ -47,6 +47,10 @@
      return true;
  }
  
+void TcpClient::sendProtocolError(const std::string& errorMessage) {
+    std::string errMsg = "ERR FROM " + displayName + " IS " + errorMessage + "\r\n";
+    sendMessage(errMsg);
+}
  // Authenticate with server - TCP implementation
  bool TcpClient::authenticate(const std::string& secret) {
      std::string authMsg = createTcpAuthMessage(username, displayName, secret);
@@ -61,10 +65,17 @@
  
  // Join a channel - TCP implementation
  bool TcpClient::joinChannel(const std::string& channelId) {
-     std::string joinMsg = createTcpJoinMessage(channelId, displayName);
-     printf_debug("Sending JOIN message: %s", joinMsg.c_str());
-     return sendMessage(joinMsg);
- }
+    std::string joinMsg = createTcpJoinMessage(channelId, displayName);
+    printf_debug("Sending JOIN message: %s", joinMsg.c_str());
+    
+    if (sendMessage(joinMsg)) {
+        // Start a 5-second timeout for join reply
+        waitingForReply = true;
+        replyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        return true;
+    }
+    return false;
+}
  
  // Send a chat message - TCP implementation
  bool TcpClient::sendChatMessage(const std::string& message) {
@@ -84,15 +95,20 @@
  
  // TCP-specific message handling
  void TcpClient::handleIncomingMessage(const ParsedMessage& msg) {
-     // Call base class implementation
-     Client::handleIncomingMessage(msg);
-     
-     // Handle malformed messages in TCP-specific way
-     if (msg.type == MessageType::UNKNOWN) {
-         std::string errMsg = "ERR FROM " + displayName + " IS Malformed message\r\n";
-         sendMessage(errMsg);
-     }
- }
+    // Reset reply waiting if this is a REPLY message
+    if (msg.type == MessageType::REPLY) {
+        waitingForReply = false;
+    }
+    
+    // Call base class implementation
+    Client::handleIncomingMessage(msg);
+    
+    // Handle malformed messages in TCP-specific way
+    if (msg.type == MessageType::UNKNOWN) {
+        sendProtocolError("Malformed message");
+        state = ClientState::TERMINATED;     // add this
+    }
+}
  
  // Main TCP client execution loop
  int TcpClient::run() {
@@ -188,8 +204,6 @@
      }
  
      // Main event loop
-     bool waitingForReply = false;
-     auto replyDeadline = std::chrono::steady_clock::now();
      std::string buffer; // Buffer to accumulate incoming data
      std::string stdinBuffer;
      bool running = true;
@@ -222,6 +236,9 @@
              
              if (remainingMs <= 0) {
                  std::cout << "ERROR: No REPLY received within 5 seconds.\n";
+                 sendProtocolError("No REPLY in time");
+                 sendByeMessage();
+                 
                  close(epoll_fd);
                  close(sockfd);
                  return EXIT_FAILURE;
@@ -292,10 +309,12 @@
                      }
                  }
                  else if (bytes == 0) {
-                     // Handle EOF on stdin (user closed input)
-                     std::string byeMsg = createTcpsByeMessage(displayName);
-                     if (write(sockfd, byeMsg.c_str(), byeMsg.length()) < 0) {
-                         perror("write BYE message");
+                     // Handle EOF on stdin (user closed input with Ctrl+D)
+                     printf_debug("EOF detected on stdin, sending BYE message");
+                     if (sendByeMessage()) {
+                         printf_debug("BYE message sent successfully on EOF");
+                     } else {
+                         printf_debug("Failed to send BYE message on EOF");
                      }
                      running = false;
                      break;
