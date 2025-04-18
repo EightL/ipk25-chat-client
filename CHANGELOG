@@ -1,0 +1,53 @@
+# CHANGELOG
+## 18-04-2025
+### Added
+- Final refactoring
+- Comments
+- Testing edge cases
+- Documentation
+
+## 16-04-2025
+### Added
+- UDP and TCP implementations done
+
+## 14-04-2025
+### Added
+- Most UDP features
+- Messages module that creates and handles both TCP/UDP messages
+
+## 08-04-2025
+- Started working on UDP - basic joining functionalily done 
+- some more refactoring
+
+### Known issues
+- Udp error handling + alot of things
+
+## 03-04-2025
+### Added
+- Refactored TCP implementation, added a Client abstract class
+- fixed some edge cases for TCP 
+
+### Known Issues
+- Udp
+
+## 29-03-2025
+### Added
+- Implemented graceful termination on SIGINT by sending a BYE message.
+- Added local command support for `/auth` (re-authentication) and `/rename` to update the display name.
+- Introduced message input validation and truncation for messages exceeding 60000 characters.
+- Added REPLY timeout logic (5 seconds) using select() with a timeout.
+
+### Fixed
+- Adjusted state transitions to correctly handle auto-join messages from the server.
+- Corrected parsing issues in the protocol message parser.
+
+### Known Issues
+- UDP client variant not implemented yet.
+- Some edge-case error handling doesnt work
+
+## 28-03-2025
+### Added
+- Basic TCP client implementation.
+- Message protocol integration with functions for AUTH, JOIN, MSG, and BYE.
+- Parsing and handling of incoming messages from the server.
+- Basic Python local server for testing

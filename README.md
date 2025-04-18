@@ -204,7 +204,9 @@ This diagram shows the UDP client implementation. It has the same high-level sta
 - **epoll(7)** – Linux man page for epoll.  
   https://man7.org/linux/man-pages/man7/epoll.7.html
 
+## License
 
+This project is licensed under the [GNU GPL v3.0](LICENSE).
 
 ## Testing
 
@@ -214,6 +216,7 @@ I tested this both on my WSL aswell as the refference VM.
 
 ### A Testing with my custom server
 For this part, I created a custom python server that simulates the IPK25-CHAT protocol for TCP and UDP. It handles all message types from specification and provides debug logs to see if everything went well. And it echoes back my messages with the correct display name.
+- You can find this server implementation in my github in `project_utils` directory.
 
 **Running the server**
 On another terminal:

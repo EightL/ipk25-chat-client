@@ -1,203 +1,299 @@
 #!/usr/bin/env python3
+"""
+IPK25‑CHAT test‑server with readable debug logging.
+"""
+import argparse
 import socket
-import select
 import struct
-import time
-import random
+import threading
+import itertools
+import logging
+import signal
+import sys
 
-HOST = '0.0.0.0'
-PORT = 4567
+# Configure logger
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("ipk25_server")
 
-# UDP message type constants per the specification.
-TYPE_CONFIRM = 0x00
-TYPE_REPLY   = 0x01
-TYPE_AUTH    = 0x02
-TYPE_JOIN    = 0x03
-TYPE_MSG     = 0x04
-TYPE_BYE     = 0xFF
+# Protocol constants
+CONFIRM = 0x00
+REPLY   = 0x01
+AUTH    = 0x02
+JOIN    = 0x03
+MSG     = 0x04
+PING    = 0xFD
+ERR     = 0xFE
+BYE     = 0xFF
+TCP_EOL = b"\r\n"
 
-# Add these variables to track clients
-client_sockets = {}  # addr -> dynamic_socket
-client_msg_ids = {}  # addr -> set of seen message IDs
+# Message ID generator
+MSG_ID_GEN = itertools.count(0)
 
-def debug_hex(data):
-    return ' '.join(f'{b:02X}' for b in data)
+def next_msg_id():
+    mid = next(MSG_ID_GEN) & 0xFFFF
+    logger.debug("[ID_GEN] -> %d", mid)
+    return mid
 
-def parse_udp_fields(data):
-    """
-    Parse the zero-terminated string fields starting from offset 3.
-    Returns a list of decoded fields.
-    """
-    fields = []
-    pos = 3  # Skip 1 byte type and 2 bytes message ID.
-    while pos < len(data):
-        try:
-            # Find next zero byte.
-            end = data.index(0, pos)
-        except ValueError:
-            break
-        field = data[pos:end].decode('ascii', errors='replace')
-        fields.append(field)
-        pos = end + 1
-    return fields
+# Helpers for binary packing
 
-def udp_handle_message(udp_sock):
-    try:
-        data, addr = udp_sock.recvfrom(1024)
-    except Exception as e:
-        print(f"[UDP] Error receiving: {e}")
-        return
-    if not data:
-        return
-    print(f"[UDP] === Received {len(data)} bytes from {addr} ===")
-    print(f"[UDP] Raw data: {debug_hex(data)}")
-    
-    if len(data) < 3:
-        print(f"[UDP] Received too short packet from {addr}")
-        return
-    msg_type = data[0]
-    (msg_id,) = struct.unpack("!H", data[1:3])
-    print(f"[UDP] Parsed Header: Type=0x{msg_type:02X}, MsgID={msg_id}")
-    
-    # Decode any zero-terminated fields.
-    fields = parse_udp_fields(data)
-    if msg_type == TYPE_AUTH:
-        if len(fields) >= 3:
-            print(f"[UDP] AUTH fields: username='{fields[0]}', displayName='{fields[1]}', secret='{fields[2]}'")
-        else:
-            print("[UDP] AUTH: Not enough fields!")
-    elif msg_type == TYPE_JOIN:
-        if len(fields) >= 2:
-            print(f"[UDP] JOIN fields: channelID='{fields[0]}', displayName='{fields[1]}'")
-        else:
-            print("[UDP] JOIN: Not enough fields!")
-    elif msg_type == TYPE_MSG:
-        if len(fields) >= 2:
-            print(f"[UDP] MSG fields: displayName='{fields[0]}', messageContent='{fields[1]}'")
-        else:
-            print("[UDP] MSG: Not enough fields!")
-    elif msg_type == TYPE_BYE:
-        if len(fields) >= 1:
-            print(f"[UDP] BYE field: displayName='{fields[0]}'")
-        else:
-            print("[UDP] BYE: Not enough fields!")
+def pack16(val):
+    packed = struct.pack('!H', val)
+    logger.debug("[PACK16] %d -> %s", val, packed)
+    return packed
+
+# === UDP Builders ===
+
+def build_confirm(ref_id):
+    logger.debug("[BUILD] CONFIRM refMsgId=%d", ref_id)
+    pkt = bytes([CONFIRM]) + pack16(ref_id)
+    logger.debug("[BYTES] %s", pkt)
+    return pkt
+
+
+def build_reply(ok, ref_id, text):
+    mid = next_msg_id()
+    logger.debug("[BUILD] REPLY mid=%d (ref %d)", mid, ref_id)
+    logger.debug("  Success: %s", ok)
+    logger.debug("  Text: '%s'", text)
+    body = bytearray([REPLY])
+    body += pack16(mid)
+    body.append(1 if ok else 0)
+    body += pack16(ref_id)
+    body.extend(text.encode('ascii', 'ignore') + b'\x00')
+    logger.debug("[BYTES] %s", body)
+    return bytes(body), mid
+
+
+def build_msg(display, content):
+    mid = next_msg_id()
+    logger.debug("[BUILD] MSG mid=%d from='%s'", mid, display)
+    logger.debug("  Content: '%s'", content)
+    pkt = bytearray([MSG])
+    pkt += pack16(mid)
+    pkt.extend(display.encode('ascii', 'ignore') + b'\x00')
+    pkt.extend(content.encode('ascii', 'ignore') + b'\x00')
+    logger.debug("[BYTES] %s", pkt)
+    return bytes(pkt), mid
+
+# === UDP Parser ===
+
+def parse_udp_packet(data):
+    length = len(data)
+    if length < 3:
+        logger.warning("[PARSE] Packet too short (%d bytes)", length)
+        return None
+
+    mtype = data[0]
+    msg_id = struct.unpack('!H', data[1:3])[0]
+    payload = data[3:]
+    logger.debug("[PARSE] type=0x%02X id=%d payload_len=%d", mtype, msg_id, len(payload))
+
+    params = []
+    if mtype in (AUTH, JOIN, MSG, ERR, BYE):
+        parts = payload.split(b'\x00')
+        params = [p.decode('ascii', 'ignore') for p in parts if p]
+        logger.debug("  Fields: %s", params)
+
+    elif mtype == REPLY:
+        success = bool(payload[0])
+        ref_id = struct.unpack('!H', payload[1:3])[0]
+        text = payload[3:].split(b'\x00')[0].decode('ascii', 'ignore')
+        params = [success, ref_id, text]
+        logger.debug("  REPLY success=%s refMsgId=%d text='%s'", success, ref_id, text)
+
     else:
-        print(f"[UDP] Received message of type 0x{msg_type:02X} with fields: {fields}")
-    
-    # Check for duplicates
-    client_key = f"{addr[0]}:{addr[1]}"
-    if client_key not in client_msg_ids:
-        client_msg_ids[client_key] = set()
-    
-    # Send CONFIRM from the receiving socket
-    confirm = struct.pack("!B H", TYPE_CONFIRM, msg_id)
-    udp_sock.sendto(confirm, addr)
-    print(f"[UDP] Sent CONFIRM for MsgID={msg_id} to {addr}")
-    
-    # Check if this is a duplicate
-    if msg_id in client_msg_ids[client_key]:
-        print(f"[UDP] Ignoring duplicate message ID {msg_id} from {addr}")
-        return
-        
-    client_msg_ids[client_key].add(msg_id)
-    
-    # For AUTH, create a new dynamic socket and respond from it
-    if msg_type == TYPE_AUTH:
-        if client_key not in client_sockets:
-            # Create dynamic socket
-            dynamic_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            dynamic_sock.bind((HOST, 0))  # Bind to random port
-            dynamic_port = dynamic_sock.getsockname()[1]
-            client_sockets[client_key] = dynamic_sock
-            print(f"[UDP] Created dynamic socket on port {dynamic_port} for {addr}")
-            
-        time.sleep(0.1)  # Existing delay
-        
-        # Send REPLY from dynamic socket
-        dynamic_sock = client_sockets[client_key]
-        new_msg_id = msg_id + 1
-        reply = struct.pack("!B H B H", TYPE_REPLY, new_msg_id, 1, msg_id)
-        content = "Auth success.".encode('ascii') + b'\x00'
-        reply += content
-        dynamic_sock.sendto(reply, addr)
-        print(f"[UDP] Sent REPLY from port {dynamic_sock.getsockname()[1]} for AUTH MsgID={msg_id} to {addr}")
-    
-    # Handle other messages using the dynamic socket if available
-    elif client_key in client_sockets and msg_type in [TYPE_JOIN, TYPE_MSG, TYPE_BYE]:
-        dynamic_sock = client_sockets[client_key]
-        time.sleep(0.1)
-        new_msg_id = msg_id + 1
-        
-        if msg_type == TYPE_JOIN:
-            reply = struct.pack("!B H B H", TYPE_REPLY, new_msg_id, 1, msg_id)
-            content = "Join success.".encode('ascii') + b'\x00'
-            reply += content  # Add this line to include the content string
-            dynamic_sock.sendto(reply, addr)
-            print(f"[UDP] Sent REPLY from dynamic socket for JOIN MsgID={msg_id} to {addr}")
-        
-        # Add handling for MSG and BYE too
-    else:
-        print(f"[UDP] No additional REPLY for message type 0x{msg_type:02X}")
+        logger.debug("  No rules for type=0x%02X", mtype)
 
-def tcp_handle_client(conn, addr):
-    print(f"[TCP] Client connected from {addr}")
-    buffer = ""
-    while True:
-        data = conn.recv(1024)
-        if not data:
-            print(f"[TCP] Client disconnected: {addr}")
-            break
-        buffer += data.decode('ascii', errors='replace')
-        while "\r\n" in buffer:
-            line, buffer = buffer.split("\r\n", 1)
-            line = line.strip()
-            if not line:
+    return mtype, msg_id, params
+
+# === TCP Builders ===
+
+def build_tcp_reply(ok, text):
+    line = f"REPLY {'OK' if ok else 'NOK'} IS {text}\r\n"
+    data = line.encode('ascii', 'ignore')
+    logger.debug("[TCP BUILD] %s", line.strip())
+    return data
+
+
+def build_tcp_msg(from_name, text):
+    line = f"MSG FROM {from_name} IS {text}\r\n"
+    data = line.encode('ascii', 'ignore')
+    logger.debug("[TCP BUILD] %s", line.strip())
+    return data
+
+# === Client Handlers ===
+
+class TcpClientHandler(threading.Thread):
+    def __init__(self, conn, addr):
+        super().__init__(daemon=True)
+        self.conn = conn
+        self.addr = addr
+        self.display = None
+        logger.info("[TCP] Connected %s", addr)
+
+    def run(self):
+        buf = b''
+        while True:
+            try:
+                chunk = self.conn.recv(4096)
+            except OSError as e:
+                logger.debug("[TCP] recv error: %s", e)
+                break
+            if not chunk:
+                logger.info("[TCP] %s disconnected", self.addr)
+                break
+
+            buf += chunk
+            logger.debug("[TCP] chunk: %s", chunk)
+
+            while TCP_EOL in buf:
+                line, buf = buf.split(TCP_EOL, 1)
+                if self.handle_line(line.decode()):
+                    break
+
+        self.conn.close()
+        logger.info("[TCP] Handler closed %s", self.addr)
+
+    def handle_line(self, line):
+        parts = line.strip().split()
+        logger.debug("[TCP] line parts: %s", parts)
+        if not parts:
+            return False
+
+        cmd = parts[0]
+        if cmd == 'AUTH' and len(parts) >= 6:
+            self.display = parts[3]
+            logger.info("[TCP] AUTH user=%s display=%s", parts[1], self.display)
+            self.conn.sendall(build_tcp_reply(True, 'Auth success.'))
+            self.conn.sendall(build_tcp_msg('Server', f"{self.display} has joined default."))
+
+        elif cmd == 'JOIN' and len(parts) >= 4:
+            logger.info("[TCP] JOIN channel=%s display=%s", parts[1], self.display)
+            self.conn.sendall(build_tcp_msg('Server', f"{self.display} has joined {parts[1]}."))
+            self.conn.sendall(build_tcp_reply(True, 'Join success.'))
+
+        elif cmd == 'MSG' and 'IS' in parts:
+            content = ' '.join(parts[parts.index('IS')+1:])
+            logger.info("[TCP] MSG from %s: %s", self.display, content) 
+            self.conn.sendall(build_tcp_msg(f"{self.display}", f"{content}"))
+
+        elif cmd == 'BYE':
+            logger.info("[TCP] BYE from %s", self.display)
+            return True
+
+        else:
+            logger.warning("[TCP] Unknown cmd: %s", parts)
+            self.conn.sendall(build_tcp_reply(False, 'Unknown command'))
+
+        return False
+
+class UdpClientHandler(threading.Thread):
+    def __init__(self, sock, addr, pkt):
+        super().__init__(daemon=True)
+        self.sock = sock
+        self.addr = addr
+        self.pkt = pkt
+        self.display = None
+
+    def run(self):
+        mtype, mid, params = self.pkt
+        logger.debug("[UDP INIT] type=0x%02X id=%d params=%s", mtype, mid, params)
+
+        if mtype == AUTH and len(params) == 3:
+            _, disp, _ = params
+            self.display = disp
+            logger.info("[UDP] AUTH display=%s", self.display)
+            self.sock.sendto(build_confirm(mid), self.addr)
+        else:
+            logger.error("[UDP] Bad initial pkt, dropping")
+            return
+
+        dyn = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        dyn.bind(('', 0))
+        port = dyn.getsockname()[1]
+        logger.info("[UDP] Using port %d for %s", port, self.addr)
+
+        reply_pkt, _ = build_reply(True, mid, 'Auth success.')
+        dyn.sendto(reply_pkt, self.addr)
+
+        while True:
+            data, addr = dyn.recvfrom(65535)
+            parsed = parse_udp_packet(data)
+            if not parsed:
                 continue
-            print(f"[TCP] Received: {line}")
-            if line.startswith("AUTH"):
-                response = "REPLY OK IS Auth success.\r\n"
-                conn.sendall(response.encode('ascii'))
-                print(f"[TCP] Sent: {response.strip()}")
-            elif line.startswith("JOIN"):
-                response = "REPLY OK IS Join success.\r\n"
-                conn.sendall(response.encode('ascii'))
-                print(f"[TCP] Sent: {response.strip()}")
-            elif line.startswith("MSG"):
-                response = "MSG FROM Server IS Thanks for your message.\r\n"
-                conn.sendall(response.encode('ascii'))
-                print(f"[TCP] Sent: {response.strip()}")
-            elif line.startswith("BYE"):
-                response = "BYE FROM Server\r\n"
-                conn.sendall(response.encode('ascii'))
-                print(f"[TCP] Sent: {response.strip()}")
-                conn.close()
-                return
+
+            typ, dm_id, prms = parsed
+            logger.debug("[UDP] pkt type=0x%02X id=%d params=%s", typ, dm_id, prms)
+            dyn.sendto(build_confirm(dm_id), addr)
+
+            if typ == JOIN and len(prms) == 2:
+                _, disp = prms
+                logger.info("[UDP] JOIN display=%s", disp)
+                pkt, _ = build_msg('Server', f"{disp} has joined {prms[0]}.")
+                dyn.sendto(pkt, addr)
+                rep, _ = build_reply(True, dm_id, 'Join success.')
+                dyn.sendto(rep, addr)
+
+            elif typ == MSG and len(prms) == 2:
+                disp, txt = prms
+                logger.info("[UDP] MSG from %s: %s", disp, txt)
+                echo, _ = build_msg(f"{disp}", txt)
+                dyn.sendto(echo, addr)
+
+            elif typ == BYE:
+                logger.info("[UDP] BYE from %s, closing", self.display)
+                break
+
             else:
-                print(f"[TCP] Unknown command: {line}")
+                logger.warning("[UDP] Unknown type=0x%02X", typ)
+
+        dyn.close()
+
+# === Server entrypoints ===
+def serve_tcp(port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('', port))
+    sock.listen()
+    logger.info("[TCP] Listening on %d", port)
+    while True:
+        conn, addr = sock.accept()
+        TcpClientHandler(conn, addr).start()
+
+
+def serve_udp(port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('', port))
+    logger.info("[UDP] Listening on %d", port)
+    while True:
+        data, addr = sock.recvfrom(65535)
+        parsed = parse_udp_packet(data)
+        if not parsed:
+            continue
+        typ, mid, prms = parsed
+        if typ == AUTH:
+            UdpClientHandler(sock, addr, parsed).start()
+        else:
+            sock.sendto(build_confirm(mid), addr)
+            logger.warning("[UDP] Rejecting pre-AUTH type=0x%02X", typ)
+
+# === Main CLI ===
 
 def main():
-    # Create and configure TCP socket.
-    tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcp_sock.bind((HOST, PORT))
-    tcp_sock.listen(5)
-    tcp_sock.setblocking(False)
-    print(f"[*] TCP server listening on {HOST}:{PORT}")
+    p = argparse.ArgumentParser()
+    p.add_argument('-t', '--transport', choices=['tcp','udp'], default='tcp')
+    p.add_argument('-p', '--port', type=int, default=4567)
+    args = p.parse_args()
+    signal.signal(signal.SIGINT, lambda *a: sys.exit(0))
 
-    # Create and configure UDP socket.
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sock.bind((HOST, PORT))
-    udp_sock.setblocking(False)
-    print(f"[*] UDP server listening on {HOST}:{PORT}")
+    if args.transport == 'tcp':
+        serve_tcp(args.port)
+    else:
+        serve_udp(args.port)
 
-    sockets = [tcp_sock, udp_sock]
-    while True:
-        readable, _, _ = select.select(sockets, [], [])
-        for s in readable:
-            if s is tcp_sock:
-                conn, addr = tcp_sock.accept()
-                tcp_handle_client(conn, addr)
-            elif s is udp_sock:
-                udp_handle_message(udp_sock)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
