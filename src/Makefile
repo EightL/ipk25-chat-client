@@ -1,3 +1,11 @@
+# Makefile for the IPK25-CHAT client application
+# 
+# Use 'make' to build the project
+# Use 'make debug' to build with debug prints
+# Use 'make clean' to remove build files
+#
+# Author: xsevcim00
+
 CXX := g++ 
 CXXFLAGS := -std=c++20 -Wall -Wextra -Werror -pedantic
 LDFLAGS :=

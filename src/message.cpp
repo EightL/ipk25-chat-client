@@ -2,9 +2,8 @@
  * @file message.cpp
  * @brief Implementation of message parsing and serialization for the IPK25-CHAT protocol
  *
- * This file provides functions for creating and parsing protocol messages in both
- * TCP (text-based) and UDP (binary) formats. It handles message serialization,
- * deserialization, and conversion between raw data and structured message objects.
+ * Provides functions to convert between raw TCP/UDP data and ParsedMessage objects,
+ * handling both text-based (TCP) and binary (UDP) formats.
  *
  * @author xsevcim00
  */
@@ -15,8 +14,9 @@
 #include <iostream>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <regex>
 
-// Convert string token to corresponding MessageType enum
+// Map a text token to its MessageType enum
 MessageType stringToMessageType(const std::string& token) {
     if (token == "AUTH")  return MessageType::AUTH;
     if (token == "JOIN")  return MessageType::JOIN;
@@ -24,321 +24,300 @@ MessageType stringToMessageType(const std::string& token) {
     if (token == "BYE")   return MessageType::BYE;
     if (token == "REPLY") return MessageType::REPLY;
     if (token == "ERR")   return MessageType::ERR;
+    // Fallback when unrecognized
     return MessageType::UNKNOWN;
 }
 
-// Create AUTH message in TCP format: "AUTH <username> AS <displayName> USING <secret>\r\n"
+// Build a TCP AUTH command string
 std::string createTcpAuthMessage(const std::string& username, const std::string& displayName, const std::string& secret) {
+    // AUTH <user> AS <display> USING <secret>\r\n
     return "AUTH " + username + " AS " + displayName + " USING " + secret + "\r\n";
 }
 
-// Create JOIN message in TCP format: "JOIN <channelID> AS <displayName>\r\n"
+// Build a TCP JOIN command string
 std::string createTcpJoinMessage(const std::string& channelID, const std::string& displayName) {
+    // JOIN <channel> AS <display>\r\n
     return "JOIN " + channelID + " AS " + displayName + "\r\n";
 }
 
-// Create MSG message in TCP format: "MSG FROM <displayName> IS <messageContent>\r\n"
+// Build a TCP MSG command string
 std::string createTcpMsgMessage(const std::string& displayName, const std::string& messageContent) {
+    // MSG FROM <display> IS <content>\r\n
     return "MSG FROM " + displayName + " IS " + messageContent + "\r\n";
 }
 
-// Create BYE message in TCP format: "BYE FROM <displayName>\r\n"
-std::string createTcpsByeMessage(const std::string& displayName) {
+// Build a TCP BYE command string
+std::string createTcpByeMessage(const std::string& displayName) {
+    // BYE FROM <display>\r\n
     return "BYE FROM " + displayName + "\r\n";
 }
 
-// Parse raw TCP message into structured ParsedMessage object
+// Helper fucntion for parseTcpMessage - expect a specific literal token from an istringstream
+static bool expectToken(std::istringstream& iss, const std::string& lit) {
+    std::string t;
+    // read next token and compare
+    return (iss >> t) && t == lit;
+}
+
+// Trim leading/trailing spaces and newlines from a string
+static std::string trim(const std::string& s) {
+    auto start = s.find_first_not_of(" \r\n");
+    if (start == std::string::npos) return ""; // all whitespace
+    auto end   = s.find_last_not_of(" \r\n");
+    return s.substr(start, end - start + 1);
+}
+
+// Parse a raw TCP line into a ParsedMessage
 ParsedMessage parseTcpMessage(const std::string& raw) {
     ParsedMessage msg;
+    msg.success = false;
     std::istringstream iss(raw);
     std::string token;
-    
-    // Parse first token to identify message type
-    if (!(iss >> token)) { 
+
+    // read message type token
+    if (!(iss >> token)) {
         msg.type = MessageType::UNKNOWN;
         return msg;
     }
+    // convert to enum
     msg.type = stringToMessageType(token);
-    
-    // Parse remaining tokens based on message type
+
+    // handle each protocol command
     switch (msg.type) {
         case MessageType::AUTH:
-            // Format: AUTH <username> AS <displayName> USING <secret>
-            if (!(iss >> msg.param1)) { msg.type = MessageType::UNKNOWN; break; } // username
-            if (!(iss >> token) || token != "AS") { msg.type = MessageType::UNKNOWN; break; } // AS keyword
-            if (!(iss >> msg.param2)) { msg.type = MessageType::UNKNOWN; break; } // displayName
-            if (!(iss >> token) || token != "USING") { msg.type = MessageType::UNKNOWN; break; } // USING keyword
-            
-            // Get remaining content as secret (param3)
-            std::getline(iss, msg.param3);
-            // Trim whitespace and CRLF
-            msg.param3.erase(0, msg.param3.find_first_not_of(" "));
-            msg.param3.erase(msg.param3.find_last_not_of(" \r\n") + 1);
+            // AUTH <user> AS <display> USING <secret>
+            if (!(iss >> msg.param1)          // username
+            || !expectToken(iss, "AS")      // literal AS
+            || !(iss >> msg.param2)         // displayName
+            || !expectToken(iss, "USING"))  // literal USING
+            {
+                msg.type = MessageType::UNKNOWN;
+                break;
+            }
+            std::getline(iss, msg.param3);   // secret + trailing
+            msg.param3 = trim(msg.param3);
             break;
 
         case MessageType::JOIN:
-            // Format: JOIN <channelID> AS <displayName>
-            if (!(iss >> msg.param1)) { msg.type = MessageType::UNKNOWN; break; } // channelID
-            if (!(iss >> token) || token != "AS") { msg.type = MessageType::UNKNOWN; break; } // AS keyword
-            if (!(iss >> msg.param2)) { msg.type = MessageType::UNKNOWN; break; } // displayName
+            // JOIN <channel> AS <display>
+            if (!(iss >> msg.param1)          // channelID
+            || !expectToken(iss, "AS")      // literal AS
+            || !(iss >> msg.param2))        // displayName
+            {
+                msg.type = MessageType::UNKNOWN;
+            }
             break;
 
         case MessageType::MSG:
-            // Format: MSG FROM <displayName> IS <messageContent>
-            if (!(iss >> token) || token != "FROM") { msg.type = MessageType::UNKNOWN; break; } // FROM keyword
-            if (!(iss >> msg.param1)) { msg.type = MessageType::UNKNOWN; break; } // displayName
-            if (!(iss >> token) || token != "IS") { msg.type = MessageType::UNKNOWN; break; } // IS keyword
-            
-            // Get remaining content as message (param2)
-            std::getline(iss, msg.param2);
-            // Trim whitespace and CRLF
-            msg.param2.erase(0, msg.param2.find_first_not_of(" "));
-            msg.param2.erase(msg.param2.find_last_not_of(" \r\n") + 1);
+            // MSG FROM <display> IS <content>
+            if (!expectToken(iss, "FROM")    // literal FROM
+            || !(iss >> msg.param1)         // displayName
+            || !expectToken(iss, "IS"))     // literal IS
+            {
+                msg.type = MessageType::UNKNOWN;
+                break;
+            }
+            std::getline(iss, msg.param2);   // messageContent
+            msg.param2 = trim(msg.param2);
             break;
 
         case MessageType::BYE:
-            // Format: BYE FROM <displayName>
-            if (!(iss >> token) || token != "FROM") { msg.type = MessageType::UNKNOWN; break; } // FROM keyword
-            if (!(iss >> msg.param1)) { msg.type = MessageType::UNKNOWN; break; } // displayName
+            // BYE FROM <display>
+            if (!expectToken(iss, "FROM")    // literal FROM
+            || !(iss >> msg.param1))        // displayName
+            {
+                msg.type = MessageType::UNKNOWN;
+            }
             break;
 
         case MessageType::REPLY:
-            // Format: REPLY <OK|NOK> IS <content>
-            if (!(iss >> token)) { msg.type = MessageType::UNKNOWN; break; } // OK or NOK
-            msg.param1 = token;
+            // REPLY <OK|NOK> IS <content>
+            if (!(iss >> token)) {           // OK/NOK
+                msg.type = MessageType::UNKNOWN;
+                break;
+            }
             msg.success = (token == "OK");
-            if (!(iss >> token) || token != "IS") { msg.type = MessageType::UNKNOWN; break; } // IS keyword
-            
-            // Get remaining content as reply message (param2)
-            std::getline(iss, msg.param2);
-            // Trim whitespace and CRLF
-            msg.param2.erase(0, msg.param2.find_first_not_of(" "));
-            msg.param2.erase(msg.param2.find_last_not_of(" \r\n") + 1);
+            if (!expectToken(iss, "IS")) {   // literal IS
+                msg.type = MessageType::UNKNOWN;
+                break;
+            }
+            std::getline(iss, msg.param2);   // messageContent
+            msg.param2 = trim(msg.param2);
             break;
 
         case MessageType::ERR:
-            // Format: ERR FROM <source> IS <errorMessage>
-            if (!(iss >> token) || token != "FROM") { msg.type = MessageType::UNKNOWN; break; } // FROM keyword
-            if (!(iss >> msg.param1)) { msg.type = MessageType::UNKNOWN; break; } // source name
-            if (!(iss >> token) || token != "IS") { msg.type = MessageType::UNKNOWN; break; } // IS keyword
-            
-            // Get remaining content as error message (param2)
-            std::getline(iss, msg.param2);
-            // Trim whitespace and CRLF
-            msg.param2.erase(0, msg.param2.find_first_not_of(" "));
-            msg.param2.erase(msg.param2.find_last_not_of(" \r\n") + 1);
+            // ERR FROM <display> IS <content>
+            if (!expectToken(iss, "FROM")    // literal FROM
+            || !(iss >> msg.param1)         // displayName
+            || !expectToken(iss, "IS"))     // literal IS
+            {
+                msg.type = MessageType::UNKNOWN;
+                break;
+            }
+            std::getline(iss, msg.param2);   // error text
+            msg.param2 = trim(msg.param2);
             break;
 
         default:
-            // Unrecognized message type
+            // unknown type
             msg.type = MessageType::UNKNOWN;
-            break;
     }
+
     return msg;
 }
 
-// Parse UDP binary message into structured ParsedMessage object
+// Parse a raw UDP packet buffer into a ParsedMessage
 ParsedMessage parseUdpMessage(const char* buffer, size_t length) {
     ParsedMessage msg;
-    
-    // Check minimum length (type + msgId = 3 bytes)
-    if (length < 3) {
-        msg.type = MessageType::UNKNOWN;
-        return msg;
-    }
-    
-    // Extract message type and ID
-    uint8_t msgType = buffer[0];
-    uint16_t msgId;
-    memcpy(&msgId, &buffer[1], 2);
-    msg.msgId = ntohs(msgId);  // Convert from network to host byte order
-    
-    // Process based on message type
-    switch (msgType) {
+    msg.type = MessageType::UNKNOWN;
+
+    // must be at least 3 bytes for header (type + msgId)
+    if (length < 3) return msg;
+
+    uint8_t type = static_cast<uint8_t>(buffer[0]);
+    uint16_t netMsgId;
+    std::memcpy(&netMsgId, buffer + 1, sizeof(netMsgId));
+    msg.msgId = ntohs(netMsgId);         // convert network order
+
+    const char* ptr = buffer + 3;        // start of payload
+    const char* end = buffer + length;
+
+    switch (type) {
         case CONFIRM_TYPE:
-            msg.type = MessageType::CONFIRM;
-            // In CONFIRM, msgId field contains the reference message ID
-            msg.refMsgId = msg.msgId;
+            msg.type     = MessageType::CONFIRM;
+            msg.refMsgId = msg.msgId;      // reference own ID
             break;
-            
+
         case REPLY_TYPE:
-            msg.type = MessageType::REPLY;
-            // REPLY: type(1) + msgId(2) + success(1) + refMsgId(2) + [content]
-            if (length >= 6) {
-                msg.success = (buffer[3] == 1);  // 1 = success, 0 = failure
-                
-                // Extract reference message ID
-                uint16_t refId;
-                memcpy(&refId, &buffer[4], 2);
-                msg.refMsgId = ntohs(refId);
-                
-                // Extract optional message content if present
-                if (length > 6) {
-                    msg.param2 = std::string(&buffer[6]);
-                }
+            // REPLY format: [type][msgId][result][refId][text]\0
+            if (length < 6) break;         // need at least result + refId
+            msg.type    = MessageType::REPLY;
+            msg.success = (buffer[3] == 1); // 1 = OK, 0 = NOK
+
+            uint16_t netRef;
+            std::memcpy(&netRef, buffer + 4, 2);
+            msg.refMsgId = ntohs(netRef); // Ref to original msg
+
+            ptr = buffer + 6;
+            // copy remaining bytes up to null terminator
+            if (ptr < end) {
+                size_t n = strnlen(ptr, end - ptr);
+                msg.param2.assign(ptr, n);
             }
             break;
-            
+
         case MSG_TYPE:
+            // MSG: [type][msgId][display]\0[content]\0
             msg.type = MessageType::MSG;
-            if (length > 3) {
-                // Extract sender's display name from null-terminated string
-                const char* displayName = &buffer[3];
-                msg.param1 = std::string(displayName);
-                
-                // Find message content after the null terminator of display name
-                const char* content = displayName + msg.param1.length() + 1;
-                if (content < buffer + length) {
-                    msg.param2 = std::string(content);
+            if (ptr < end) {
+                size_t n = strnlen(ptr, end - ptr);
+                msg.param1.assign(ptr, n);     // displayName
+                ptr += n + 1;                  // skip over null
+                if (ptr < end) {
+                    size_t m = strnlen(ptr, end - ptr);
+                    msg.param2.assign(ptr, m); // messageContent
                 }
             }
             break;
-            
+
         case BYE_TYPE:
+            // BYE: [type][msgId][display]\0
             msg.type = MessageType::BYE;
-            if (length > 3) {
-                // Extract display name from null-terminated string
-                const char* displayName = &buffer[3];
-                msg.param1 = std::string(displayName);
+            if (ptr < end) {
+                size_t n = strnlen(ptr, end - ptr);
+                msg.param1.assign(ptr, n);     // displayName
             }
             break;
-            
+
         case ERR_TYPE:
+            // ERR: [type][msgId][display]\0[text]\0
             msg.type = MessageType::ERR;
-            if (length > 3) {
-                // Extract source name from null-terminated string
-                const char* sourceName = &buffer[3];
-                msg.param1 = std::string(sourceName);
-                
-                // Find error message after the null terminator of source name
-                const char* errMsg = sourceName + msg.param1.length() + 1;
-                if (errMsg < buffer + length) {
-                    msg.param2 = std::string(errMsg);
+            if (ptr < end) {
+                size_t n = strnlen(ptr, end - ptr);
+                msg.param1.assign(ptr, n);     // source display
+                ptr += n + 1;
+                if (ptr < end) {
+                    size_t m = strnlen(ptr, end - ptr);
+                    msg.param2.assign(ptr, m); // error message
                 }
             }
             break;
-            
+
         case PING_TYPE:
+            // PING only contains header
             msg.type = MessageType::PING;
             break;
-            
+
         default:
-            msg.type = MessageType::UNKNOWN;
+            // else UNKNOWN
+            break;
     }
-    
+
     return msg;
 }
 
-// Create AUTH message in UDP binary format
-std::vector<char> createUdpAuthMessage(uint16_t msgId, const std::string& username, 
-                                const std::string& displayName, const std::string& secret) {
-    std::vector<char> message;
-    
-    // Add message type
-    message.push_back(AUTH_TYPE);
-    
-    // Add message ID (convert to network byte order)
-    uint16_t netMsgId = htons(msgId);
-    message.push_back(reinterpret_cast<char*>(&netMsgId)[0]);
-    message.push_back(reinterpret_cast<char*>(&netMsgId)[1]);
-    
-    // Add username, displayName, and secret as null-terminated strings
-    message.insert(message.end(), username.begin(), username.end());
-    message.push_back('\0');
-    message.insert(message.end(), displayName.begin(), displayName.end());
-    message.push_back('\0');
-    message.insert(message.end(), secret.begin(), secret.end());
-    message.push_back('\0');
-    
-    return message;
+// Helper to push a 16-bit network-order ID into a vector
+static void pushNet16(std::vector<char>& v, uint16_t value) {
+    uint16_t net = htons(value);
+    v.push_back(reinterpret_cast<char*>(&net)[0]);
+    v.push_back(reinterpret_cast<char*>(&net)[1]);
 }
 
-// Create JOIN message in UDP binary format
-std::vector<char> createUdpJoinMessage(uint16_t msgId, const std::string& channelID, const std::string& displayName) {
-    std::vector<char> message;
-    
-    // Add message type
-    message.push_back(JOIN_TYPE);
-    
-    // Add message ID (convert to network byte order)
-    uint16_t netMsgId = htons(msgId);
-    message.push_back(reinterpret_cast<char*>(&netMsgId)[0]);
-    message.push_back(reinterpret_cast<char*>(&netMsgId)[1]);
-    
-    // Add channelID and displayName as null-terminated strings
-    message.insert(message.end(), channelID.begin(), channelID.end());
-    message.push_back('\0');
-    message.insert(message.end(), displayName.begin(), displayName.end());
-    message.push_back('\0');
-    
-    return message;
-}
-
-// Create MSG message in UDP binary format
-std::vector<char> createUdpMsgMessage(uint16_t msgId, const std::string& displayName, const std::string& msgContent) {
-    std::vector<char> message;
-    
-    // Add message type
-    message.push_back(MSG_TYPE);
-    
-    // Add message ID (convert to network byte order)
-    uint16_t netMsgId = htons(msgId);
-    message.push_back(reinterpret_cast<char*>(&netMsgId)[0]);
-    message.push_back(reinterpret_cast<char*>(&netMsgId)[1]);
-    
-    // Add displayName and message content as null-terminated strings
-    message.insert(message.end(), displayName.begin(), displayName.end());
-    message.push_back('\0');
-    message.insert(message.end(), msgContent.begin(), msgContent.end());
-    message.push_back('\0');
-    
-    return message;
-}
- 
-// Create BYE message in UDP binary format
-std::vector<char> createUdpByeMessage(uint16_t msgId, const std::string& displayName) {
-    std::vector<char> message;
-    
-    // Add message type
-    message.push_back(BYE_TYPE);
-    
-    // Add message ID (convert to network byte order)
-    uint16_t netMsgId = htons(msgId);
-    message.push_back(reinterpret_cast<char*>(&netMsgId)[0]);
-    message.push_back(reinterpret_cast<char*>(&netMsgId)[1]);
-    
-    // Add displayName as a null-terminated string
-    message.insert(message.end(), displayName.begin(), displayName.end());
-    message.push_back('\0');
-    
-    return message;
-}
-
-// Create ERR message in UDP binary format
-std::vector<char> createUdpErrMessage(uint16_t msgId, const std::string& displayName, const std::string& text) {
+// Serialize an AUTH message into UDP binary form
+std::vector<char> createUdpAuthMessage(uint16_t msgId, const std::string& username, const std::string& displayName, const std::string& secret) {
     std::vector<char> m;
-    m.push_back(ERR_TYPE);                                // 0xFE
-    uint16_t net = htons(msgId);
-    m.insert(m.end(), reinterpret_cast<char*>(&net),
-                       reinterpret_cast<char*>(&net)+2);
-    m.insert(m.end(), displayName.begin(), displayName.end());
-    m.push_back('\0');
-    m.insert(m.end(), text.begin(), text.end());
-    m.push_back('\0');
+    m.push_back(AUTH_TYPE);
+    pushNet16(m, msgId);
+    // we append nul-terminated fields in order
+    m.insert(m.end(), username.begin(), username.end());   m.push_back('\0');
+    m.insert(m.end(), displayName.begin(), displayName.end()); m.push_back('\0');
+    m.insert(m.end(), secret.begin(), secret.end());       m.push_back('\0');
     return m;
 }
 
-// Create CONFIRM message in UDP binary format
+// Serialize a JOIN message into UDP binary form
+std::vector<char> createUdpJoinMessage(uint16_t msgId, const std::string& channelID, const std::string& displayName) {
+    std::vector<char> m;
+    m.push_back(JOIN_TYPE);
+    pushNet16(m, msgId);
+    m.insert(m.end(), channelID.begin(), channelID.end());    m.push_back('\0');
+    m.insert(m.end(), displayName.begin(), displayName.end()); m.push_back('\0');
+    return m;
+}
+
+// Serialize a MSG into UDP binary form
+std::vector<char> createUdpMsgMessage(uint16_t msgId, const std::string& displayName, const std::string& msgContent) {
+    std::vector<char> m;
+    m.push_back(MSG_TYPE);
+    pushNet16(m, msgId);
+    m.insert(m.end(), displayName.begin(), displayName.end()); m.push_back('\0');
+    m.insert(m.end(), msgContent.begin(), msgContent.end());  m.push_back('\0');
+    return m;
+}
+
+// Serialize a BYE into UDP binary form
+std::vector<char> createUdpByeMessage(uint16_t msgId, const std::string& displayName) {
+    std::vector<char> m;
+    m.push_back(BYE_TYPE);
+    pushNet16(m, msgId);
+    m.insert(m.end(), displayName.begin(), displayName.end()); m.push_back('\0');
+    return m;
+}
+
+// Serialize an ERR into UDP binary form
+std::vector<char> createUdpErrMessage(uint16_t msgId, const std::string& displayName, const std::string& text) {
+    std::vector<char> m;
+    m.push_back(ERR_TYPE);
+    pushNet16(m, msgId);
+    m.insert(m.end(), displayName.begin(), displayName.end()); m.push_back('\0');
+    m.insert(m.end(), text.begin(), text.end());              m.push_back('\0');
+    return m;
+}
+
+// Serialize a CONFIRM message referencing a prior UDP packet
 std::vector<char> createUdpConfirmMessage(uint16_t refMsgId) {
-    std::vector<char> message;
-    
-    // Add message type
-    message.push_back(CONFIRM_TYPE);
-    
-    // Add reference message ID (convert to network byte order)
-    uint16_t netMsgId = htons(refMsgId);
-    message.push_back(reinterpret_cast<char*>(&netMsgId)[0]);
-    message.push_back(reinterpret_cast<char*>(&netMsgId)[1]);
-    
-    return message;
+    std::vector<char> m;
+    m.push_back(CONFIRM_TYPE);
+    pushNet16(m, refMsgId);   // only header needed
+    return m;
 }

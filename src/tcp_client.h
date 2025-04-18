@@ -2,120 +2,114 @@
  * @file tcp_client.h
  * @brief TCP-specific implementation of the Client interface for IPK25-CHAT
  *
- * This file defines the TCP client class that implements the Client interface
- * with connection-oriented TCP communication according to the IPK25-CHAT protocol.
+ * Defines TcpClient for connection-oriented TCP communication with the
+ * IPK25-CHAT protocol, using non-blocking I/O and epoll for event handling.
  *
  * @author xsevcim00
  */
+#ifndef TCP_CLIENT_H
+#define TCP_CLIENT_H
 
- #ifndef TCP_CLIENT_H
- #define TCP_CLIENT_H
- 
- #include <chrono>
- #include "client.h"
- 
- /**
-  * @brief TCP client implementation for the IPK25-CHAT protocol
-  *
-  * The TcpClient class provides TCP-specific implementation of the Client interface.
-  * It handles connection establishment, text-based protocol communication, and
-  * reliable message delivery through the built-in TCP reliability mechanisms.
-  */
- class TcpClient : public Client {
- private:
-     std::string serverAddress;              ///< Server hostname or IP address
-     int serverPort;                         ///< Server port number
-     std::chrono::steady_clock::time_point terminationStartTime; ///< Timestamp when graceful termination began
-     bool isWaitingForTermination = false;   ///< Whether client is waiting for termination to complete
-     bool waitingForReply = false;           ///< Whether client is waiting for a server reply
-     std::chrono::steady_clock::time_point replyDeadline; ///< Deadline for receiving a reply
-     
-     /**
-      * @brief Sends a text message to the server
-      *
-      * Transmits a message over the established TCP connection.
-      *
-      * @param msg The text message to send
-      * @return true if the message was sent successfully, false otherwise
-      */
-     bool sendMessage(const std::string& msg);
-     
- protected:
-     /**
-      * @brief Handles incoming TCP messages
-      *
-      * Processes received messages according to protocol specification,
-      * with TCP-specific behavior like handling malformed messages.
-      *
-      * @param msg The parsed message to handle
-      */
-     virtual void handleIncomingMessage(const ParsedMessage& msg) override;
-     
-     /**
-      * @brief Implements TCP-specific authentication
-      *
-      * @param secret The authentication secret
-      * @return true if authentication was initiated successfully, false otherwise
-      */
-     virtual bool authenticate(const std::string& secret) override;
-     
-     /**
-      * @brief Implements TCP-specific channel join request
-      *
-      * @param channelId The ID of the channel to join
-      * @return true if the join request was sent successfully, false otherwise
-      */
-     virtual bool joinChannel(const std::string& channelId) override;
-     
-     /**
-      * @brief Implements TCP-specific chat message transmission
-      *
-      * @param message The message content to send
-      * @return true if the message was sent successfully, false otherwise
-      */
-     virtual bool sendChatMessage(const std::string& message) override;
-     
-     /**
-      * @brief Implements TCP-specific disconnect message
-      *
-      * @return true if the BYE message was sent successfully, false otherwise
-      */
-     virtual bool sendByeMessage() override;
+#include <chrono>
+#include "client.h"
 
-     /**
-      * @brief Sends a protocol error message to the server
-      *
-      * Transmits an error message over the established TCP connection.
-      *
-      * @param errorMessage The error message to send
-      */
-     virtual void sendProtocolError(const std::string& errorMessage) override;
-     
- public:
-     /**
-      * @brief Constructs a TCP client
-      *
-      * @param serverIp Server hostname or IP address
-      * @param port Server port number
-      */
-     TcpClient(const std::string& serverIp, int port);
-     
-     /**
-      * @brief Destructor for TCP client
-      *
-      * Cleans up any resources not handled by the base class destructor.
-      */
-     virtual ~TcpClient();
-     
-     /**
-      * @brief Main execution loop for the TCP client
-      *
-      * Sets up the TCP connection, handles events, processes messages,
-      * and implements the event-driven client logic.
-      *
-      * @return EXIT_SUCCESS on successful termination, EXIT_FAILURE on error
-      */
-     virtual int run() override;
- };
- 
- #endif // TCP_CLIENT_H
+/**
+ * @brief TCP client implementation for the IPK25-CHAT protocol
+ *
+ * Handles connection establishment, text-based framing (CRLF‑terminated messages),
+ * reliable delivery via built‑in TCP mechanisms, and an event‑driven loop.
+ */
+class TcpClient : public Client {
+private:
+    // server connection parameters
+    std::string serverAddress; // server hostname or IP address
+    int serverPort; // server port number
+
+    // graceful shutdown tracking
+    std::chrono::steady_clock::time_point terminationStartTime;
+    bool isWaitingForTermination = false; // waiting for BYE to confirm
+
+    // reply timeout tracking
+    bool waitingForReply = false;  // awaiting REPLY from server
+    std::chrono::steady_clock::time_point replyDeadline; // when REPLY deadline expires
+
+    /**
+     * @brief Send a raw string over the TCP socket
+     * @param msg The complete message (including "\r\n")
+     * @return true if write succeeded, false on error
+     */
+    bool sendMessage(const std::string& msg);
+
+    /**
+     * @brief Read available socket data, extract complete CRLF‑terminated messages
+     * @param buffer Accumulates partial reads between calls
+     */
+    void processSocketInput(std::string& buffer);
+
+protected:
+    /**
+     * @brief Handle a parsed incoming message
+     * @param msg The ParsedMessage to process
+     */
+    virtual void handleIncomingMessage(const ParsedMessage& msg) override;
+
+    /**
+     * @brief Send AUTH request to the server
+     * @param secret The authentication secret
+     * @return true if AUTH was sent and timeout started
+     */
+    virtual bool authenticate(const std::string& secret) override;
+
+    /**
+     * @brief Send JOIN request to the server
+     * @param channelId Identifier of the channel to join
+     * @return true if JOIN was sent and timeout started
+     */
+    virtual bool joinChannel(const std::string& channelId) override;
+
+    /**
+     * @brief Send a chat message
+     * @param message The message content to send
+     * @return true if MSG was sent successfully
+     */
+    virtual bool sendChatMessage(const std::string& message) override;
+
+    /**
+     * @brief Send a BYE message and mark termination
+     * @return true if BYE was sent successfully
+     */
+    virtual bool sendByeMessage() override;
+
+    /**
+     * @brief Send a protocol error message
+     * @param errorMessage Description of the error
+     */
+    virtual void sendProtocolError(const std::string& errorMessage) override;
+
+public:
+    /**
+     * @brief Construct a TCP client instance
+     * @param serverIp Hostname or IP address of the server
+     * @param port TCP port to connect to
+     */
+    TcpClient(const std::string& serverIp, int port);
+
+    /**
+     * @brief Destructor for TcpClient
+     *
+     * Cleans up any resources not handled by base destructor.
+     */
+    virtual ~TcpClient();
+
+    /**
+     * @brief Run the TCP client's main event loop
+     *
+     * Resolves the server address, connects, sets up epoll on socket and stdin,
+     * and dispatches events until termination.
+     *
+     * @return EXIT_SUCCESS on clean termination, EXIT_FAILURE on error
+     */
+    virtual int run() override;
+};
+
+#endif // TCP_CLIENT_H

@@ -2,178 +2,172 @@
  * @file udp_client.h
  * @brief UDP-specific implementation of the Client interface for IPK25-CHAT
  *
- * This file defines the UDP client class that implements the Client interface
- * with connectionless UDP communication, reliable message delivery through
- * retransmissions, and message confirmation according to the IPK25-CHAT protocol.
+ * Defines UdpClient for connectionless UDP communication with reliable
+ * delivery, retransmissions, and dynamic server port handling.
  *
  * @author xsevcim00
  */
+#ifndef UDP_CLIENT_H
+#define UDP_CLIENT_H
 
- #ifndef UDP_CLIENT_H
- #define UDP_CLIENT_H
- 
- #include <netinet/in.h>
- #include <chrono>
- #include "client.h"
- 
- /**
-  * @brief UDP client implementation for the IPK25-CHAT protocol
-  *
-  * The UdpClient class provides UDP-specific implementation of the Client interface.
-  * It handles reliability over the connectionless UDP protocol through message IDs,
-  * retransmissions, and confirmation messages. It also manages dynamic server port
-  * changes that may occur with UDP servers.
-  */
- class UdpClient : public Client {
- private:
-     std::string serverAddress;              ///< Server hostname or IP address
-     int serverPort;                         ///< Server port number
-     uint16_t timeoutMs;                     ///< Timeout for message retransmissions in milliseconds
-     uint8_t maxRetransmissions;             ///< Maximum number of retransmission attempts
-     bool fatalError = false;                ///< Flag for fatal errors
-     uint16_t nextMsgId = 0;                 ///< Next message ID to use
-     std::set<uint16_t> seenMsgIds;          ///< Set of already processed message IDs to avoid duplicates
-     sockaddr_in serverAddr;                 ///< Server socket address structure
-     std::chrono::steady_clock::time_point closingDeadline; ///< Deadline for termination sequence
-     std::chrono::steady_clock::time_point terminationStartTime; ///< Timestamp when graceful termination began
-     bool isWaitingForTermination = false;   ///< Whether client is waiting for termination to complete
-     
-     /**
-      * @brief Generates the next unique message ID
-      *
-      * @return Next sequential message ID
-      */
-     uint16_t getNextMsgId();
-     
-     /**
-      * @brief Updates server address if response comes from a different port
-      *
-      * UDP servers may respond from a different port than the one initially used.
-      * This method detects that and updates the stored server address.
-      *
-      * @param peerAddr The address from which a response was received
-      */
-     void checkAndUpdateServerPort(const sockaddr_in& peerAddr);
-     
-     /**
-      * @brief Authenticates with retries and timeout handling
-      *
-      * Sends authentication request and handles the complete authentication flow
-      * including retransmissions and waiting for the server's reply.
-      *
-      * @param secret The authentication secret
-      * @return true if authentication succeeded, false otherwise
-      */
-     bool authenticateWithRetries(const std::string& secret);
-     
-     /**
-      * @brief Sends a UDP message with optional reliability
-      *
-      * Sends a binary message over UDP, with optional confirmation requirement.
-      * When confirmation is required, implements retransmission logic.
-      *
-      * @param msg The binary message to send
-      * @param requireConfirm Whether to wait for confirmation (true by default)
-      * @return true if message was sent successfully (and confirmed if required), false otherwise
-      */
-     bool sendUdpMessage(const std::vector<char>& msg, bool requireConfirm = true);
-     
-     /**
-      * @brief Initiates graceful termination process
-      *
-      * Starts the process of cleanly disconnecting from the server,
-      * setting up state and timers for BYE message transmission.
-      */
-     void startGracefulTermination();
-     
- protected:
-     /**
-      * @brief Handles incoming UDP messages
-      *
-      * Processes received messages according to protocol specification, with
-      * UDP-specific behavior like handling CONFIRM messages and tracking message IDs.
-      *
-      * @param msg The parsed message to handle
-      */
-     virtual void handleIncomingMessage(const ParsedMessage& msg) override;
-     
-     /**
-      * @brief Implements UDP-specific authentication
-      *
-      * @param secret The authentication secret
-      * @return true if authentication was initiated successfully, false otherwise
-      */
-     virtual bool authenticate(const std::string& secret) override;
-     
-     /**
-      * @brief Implements UDP-specific channel join request
-      *
-      * @param channelId The ID of the channel to join
-      * @return true if the join request was sent successfully, false otherwise
-      */
-     virtual bool joinChannel(const std::string& channelId) override;
-     
-     /**
-      * @brief Implements UDP-specific chat message transmission
-      *
-      * @param message The message content to send
-      * @return true if the message was sent successfully, false otherwise
-      */
-     virtual bool sendChatMessage(const std::string& message) override;
-     
-     /**
-      * @brief Implements UDP-specific disconnect message
-      *
-      * @return true if the BYE message was sent and confirmed, false otherwise
-      */
-     virtual bool sendByeMessage() override;
-     
-    /**
-     * @brief Waits for a REPLY message with a specified reference ID
-     *
-     * Waits up to 5 seconds for a REPLY message matching the expected reference ID.
-     * Handles and confirms other messages received during the wait.
-     *
-     * @param expectedRefId The message ID to match in the REPLY's refMsgId field
-     * @return true if a successful REPLY is received, false otherwise
-     */
-    bool awaitReply(uint16_t expectedRefId);
+#include <netinet/in.h>
+#include <chrono>
+#include <unordered_set>
+#include "client.h"
 
- public:
-     /**
-      * @brief Constructs a UDP client
-      *
-      * @param serverIp Server hostname or IP address
-      * @param port Server port number
-      * @param timeout Timeout between retransmissions in milliseconds
-      * @param retransmissions Maximum number of retransmission attempts
-      */
-     UdpClient(const std::string& serverIp, int port, 
-               uint16_t timeout, uint8_t retransmissions);
-     
-     /**
-      * @brief Destructor for UDP client
-      *
-      * Cleans up any resources not handled by the base class destructor.
-      */
-     virtual ~UdpClient();
-     
-     /**
-      * @brief Main execution loop for the UDP client
-      *
-      * Sets up the UDP socket, handles events, processes messages,
-      * and implements the event-driven client logic.
-      *
-      * @return EXIT_SUCCESS on successful termination, EXIT_FAILURE on error
-      */
-     virtual int run() override;
+class UdpClient : public Client {
+    private:
+        std::string serverAddress;               // server hostname or IP
+        int         serverPort;                  // UDP port number
+        uint16_t    timeoutMs;                   // per-message timeout (ms)
+        uint8_t     maxRetransmissions;          // maximum retry count
+        uint16_t    nextMsgId = 1;               // next unique message ID
+        int         epollFd     = -1;            // epoll file descriptor
+        sockaddr_in serverAddr{};                // resolved server address
+        bool        fatalError  = false;         // indicates a fatal error
+        std::unordered_set<uint16_t> seenMsgIds; // processed message IDs
 
-     /**
-      * @brief Sends a protocol error message to the server
-      *
-      * @param errorMessage The error message content
-      */
-     void sendProtocolError(const std::string& errorMessage) override;
- };
- 
- #endif // UDP_CLIENT_H
+        /**
+         * @brief Generate the next unique message ID
+         * @return next message ID
+         */
+        uint16_t getNextMsgId();
+
+        /**
+         * @brief Update server port if peer port has changed
+         * @param peerAddr peer sockaddr_in from recvfrom
+         */
+        void checkAndUpdateServerPort(const sockaddr_in& peerAddr);
+
+        /**
+         * @brief Send a UDP message, optionally requiring confirmation
+         * @param msg byte vector containing the packet
+         * @param requireConfirm true to wait for a CONFIRM response
+         * @return true if send (and confirm if required) succeeded
+         */
+        bool sendUdpMessage(const std::vector<char>& msg, bool requireConfirm);
+
+        /**
+         * @brief Wait for a REPLY matching the expected message ID
+         * @param expectedRefId reference ID to match in incoming REPLY
+         * @return true if a positive REPLY was received
+         */
+        bool awaitReply(uint16_t expectedRefId);
+
+        /**
+         * @brief Handle available stdin data in the event loop
+         * @param buf buffer to accumulate and parse input lines
+         * @return EXIT_SUCCESS on normal processing, EXIT_FAILURE on error
+         */
+        int handleStdinEvent(std::string& buf);
+
+        /**
+         * @brief Handle an incoming UDP packet event
+         * @param buf buffer to receive packet data
+         */
+        void handleSocketEvent(char* buf);
+
+        /**
+         * @brief Initialize UDP socket, bind and resolve server address
+         * @return true on successful socket setup
+         */
+        bool initSocket();
+
+        /**
+         * @brief Configure epoll to watch socket and stdin
+         * @return true if epoll setup succeeded
+         */
+        bool setupEpoll();
+
+        /**
+         * @brief Run the epoll-based event loop
+         * @return EXIT_SUCCESS on clean exit, EXIT_FAILURE on error
+         */
+        int eventLoop();
+
+        /**
+         * @brief Send a CONFIRM message for a received packet
+         * @param msgId message ID to confirm
+         */
+        void sendConfirm(uint16_t msgId);
+
+        /**
+         * @brief Check if a message ID has already been processed
+         * @param msgId message ID to check
+         * @return true if the ID was seen before
+         */
+        bool isDuplicate(uint16_t msgId);
+
+        /**
+         * @brief Send a BYE message and wait for its CONFIRM
+         */
+        void sendByeAndWaitConfirm();
+
+        /**
+         * @brief Clean up resources and close socket
+         */
+        void cleanup();
+
+    protected:
+        /**
+         * @brief Handle parsed incoming UDP messages
+         * @param msg the ParsedMessage to process
+         */
+        virtual void handleIncomingMessage(const ParsedMessage& msg) override;
+
+        /**
+         * @brief Perform UDP-specific authentication
+         * @param secret authentication secret
+         * @return true if AUTH succeeded
+         */
+        virtual bool authenticate(const std::string& secret) override;
+
+        /**
+         * @brief Perform UDP-specific channel join
+         * @param channelId identifier of channel to join
+         * @return true if JOIN succeeded
+         */
+        virtual bool joinChannel(const std::string& channelId) override;
+
+        /**
+         * @brief Send a chat message over UDP
+         * @param message content to send
+         * @return true if MSG succeeded
+         */
+        virtual bool sendChatMessage(const std::string& message) override;
+
+        /**
+         * @brief Send BYE message over UDP
+         * @return true if BYE succeeded
+         */
+        virtual bool sendByeMessage() override;
+
+        /**
+         * @brief Send a protocol ERR message without confirmation
+         * @param err error text to send
+         */
+        virtual void sendProtocolError(const std::string& err) override;
+
+    public:
+        /**
+         * @brief Construct a UDP client
+         * @param serverIp server hostname or IP
+         * @param port server UDP port
+         * @param timeout per-message confirmation timeout (ms)
+         * @param retransmissions max number of retries per message
+         */
+        UdpClient(const std::string& serverIp, int port, uint16_t timeout, uint8_t retransmissions);
+
+        /**
+         * @brief Destructor for UDP client
+         */
+        virtual ~UdpClient();
+
+        /**
+         * @brief Run the UDP client: init, event loop, cleanup
+         * @return EXIT_SUCCESS on success, EXIT_FAILURE on error
+         */
+        virtual int run() override;
+};
+
+#endif // UDP_CLIENT_H

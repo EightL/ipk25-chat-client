@@ -21,10 +21,12 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <chrono>
+#include <array>
 #include <signal.h>
 
-// External signal handler variable declared in main.cpp
+// flag set by main on SIGINT for graceful exit
 extern volatile sig_atomic_t terminationRequested;
+
 const int OVERALL_TIMEOUT_MS = 5000; // 5 seconds overall timeout
 
 // Initialize UDP client with server details and transmission parameters
@@ -53,560 +55,379 @@ void UdpClient::checkAndUpdateServerPort(const sockaddr_in& peerAddr) {
     }
 }
 
-// Send a UDP message, with optional reliable delivery via retransmissions
+// Check if the overall timeout has been exceeded
+static bool overallTimeoutExceeded(const std::chrono::steady_clock::time_point& start) {
+    constexpr int OVERALL_MS = 5000;
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start
+    ).count();
+    return elapsed >= OVERALL_MS;
+}
+
+// Send a UDP message, optionally requiring confirmation
 bool UdpClient::sendUdpMessage(const std::vector<char>& msg, bool requireConfirm) {
     if (!requireConfirm) {
-        // Just send the message once without waiting for confirmation
-        printf_debug("Sending message without confirmation (type: %d)", msg[0]);
-        sendto(socketFd, msg.data(), msg.size(), 0,
-               reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
-        return true;
+        ssize_t sent = sendto(socketFd, msg.data(), msg.size(), 0, reinterpret_cast<const sockaddr*>(&serverAddr), sizeof(serverAddr));
+        if (sent < 0) perror("sendto");
+        printf_debug("Sent (no confirm) type=%d, bytes=%zd", msg[0], sent);
+        return sent >= 0;
     }
-    
-    // With retransmissions
-    int attempts = 0;
-    bool confirmed = false;
+
+    // Reliable send: initial + retries
     uint16_t msgId = 0;
-    
-    // Extract message ID from binary message
     if (msg.size() >= 3) {
         memcpy(&msgId, &msg[1], 2);
-        msgId = ntohs(msgId); 
-        printf_debug("Sending message type %d with ID %d, waiting for confirmation", msg[0], msgId);
+        msgId = ntohs(msgId);
     }
-    
-    auto startTime = std::chrono::steady_clock::now();
-    auto lastSendTime = startTime;
-    
-    // Initial send
-    sendto(socketFd, msg.data(), msg.size(), 0,
-           reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
-    
-    while (!confirmed && attempts < maxRetransmissions && state != ClientState::TERMINATED) {
-        // At the start of each iteration
-        printf_debug("[DEBUG-TERM] Retransmission loop: attempt %d/%d, client state: %d", 
-                    attempts, maxRetransmissions, (int)state);
+    int attempts = 0;
+    bool confirmed = false;
+    auto start = std::chrono::steady_clock::now();
 
-        char buffer[1024];
-        sockaddr_in peerAddr;
-        socklen_t peerLen = sizeof(peerAddr);
-        
-        // Wait for response with timeout
-        fd_set readfds;
-        struct timeval tv;
-        FD_ZERO(&readfds);
-        FD_SET(socketFd, &readfds);
-        tv.tv_sec = 0;
-        tv.tv_usec = timeoutMs * 1000;
-        
-        int ready = select(socketFd + 1, &readfds, NULL, NULL, &tv);
-        
-        // Check if terminated during select
-        if (state == ClientState::TERMINATED) {
-            printf_debug("Client terminated during message confirmation, aborting");
-            return false;
-        }
-        
-        if (ready > 0) {
-            ssize_t bytes = recvfrom(socketFd, buffer, sizeof(buffer), 0,
-                                     reinterpret_cast<sockaddr*>(&peerAddr), &peerLen);
-            if (bytes > 0) {
-                // Update server port if needed
-                checkAndUpdateServerPort(peerAddr);
-                
-                // Parse message
-                ParsedMessage response = parseUdpMessage(buffer, bytes);
-                printf_debug("Received response of type %d with ID %d while waiting for CONFIRM for msgId %d", 
-                           (int)response.type, response.msgId, msgId);
-                
-                // Check if it's a CONFIRM for our message
-                if (response.type == MessageType::CONFIRM && response.refMsgId == msgId) {
-                    printf_debug("Received confirmation for message ID %d", msgId);
-                    confirmed = true;
-                    break;
-                } 
-                else if (response.type != MessageType::UNKNOWN) {
-                    // Confirm other messages from server
-                    printf_debug("Received non-target message (type: %d, ID: %d), sending CONFIRM", 
-                               (int)response.type, response.msgId);
-                    std::vector<char> confirmMsg = createUdpConfirmMessage(response.msgId);
-                    sendto(socketFd, confirmMsg.data(), confirmMsg.size(), 0,
-                           reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
-                    
-                    // Process the received message
-                    handleIncomingMessage(response);
-                    
-                    // Check if we transitioned to TERMINATED state
-                    if (state == ClientState::TERMINATED) {
-                        printf_debug("Client transitioned to TERMINATED state while waiting for confirmation");
-                        return false;
-                    }
-                }
-            }
-        } else {
-            // Timeout - retransmit
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSendTime).count();
-            
-            // Check if we're in TERMINATED state before retransmitting
-            if (state == ClientState::TERMINATED) {
-                printf_debug("Detected TERMINATED state, breaking out of retransmission loop");
-                return false;
-            }
-            
-            if (elapsed >= timeoutMs) {
-                printf_debug("Timeout (no response in %d ms) for message ID %d, retransmitting (attempt %d/%d)", 
-                           timeoutMs, msgId, attempts+1, maxRetransmissions);
-                sendto(socketFd, msg.data(), msg.size(), 0,
-                       reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
-                lastSendTime = now;
-                attempts++;
-            }
-        }
-        
-        // Check overall timeout (5 seconds) and state before next iteration
-        auto now = std::chrono::steady_clock::now();
-        auto overallElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
-        if (state == ClientState::TERMINATED) {
-            printf_debug("Detected TERMINATED state, breaking out of retransmission loop");
-            return false;
-        }
-        if (overallElapsed >= OVERALL_TIMEOUT_MS) {
-            printf_debug("ERROR: Overall timeout (%d ms) reached for message ID %d", OVERALL_TIMEOUT_MS, msgId);
+    // initial send
+    ssize_t rc = sendto(socketFd, msg.data(), msg.size(), 0, reinterpret_cast<const sockaddr*>(&serverAddr), sizeof(serverAddr));
+    if (rc < 0) {
+        perror("sendto");
+    }
+    printf_debug("send attempt %d for id=%d, bytes=%zd", attempts + 1, msgId, rc);
+
+    // loop until confirm or retries exhausted or terminated
+    while (!confirmed && attempts < maxRetransmissions && state != ClientState::TERMINATED) {
+        if (overallTimeoutExceeded(start)) {
             std::cout << "ERROR: Message transmission timeout (5 seconds)" << std::endl;
             return false;
         }
 
-        // After processing any message, double-check state
-        if (state == ClientState::TERMINATED) {
-            printf_debug("[DEBUG-TERM] State changed to TERMINATED during message processing");
-            return false;
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(socketFd, &rfds);
+        struct timeval tv{0, static_cast<int>(timeoutMs * 1000)};
+        int ready = select(socketFd + 1, &rfds, nullptr, nullptr, &tv);
+        if (state == ClientState::TERMINATED) break;
+
+        if (ready > 0) {
+            // handle incoming
+            char buf[65536];
+            sockaddr_in peer{};
+            socklen_t len = sizeof(peer);
+            ssize_t n = recvfrom(socketFd, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&peer), &len);
+            if (n > 0) {
+                checkAndUpdateServerPort(peer);
+                ParsedMessage resp = parseUdpMessage(buf, n);
+
+                if (resp.type == MessageType::CONFIRM && resp.refMsgId == msgId) {
+                    confirmed = true;
+                    break;
+                }
+                else if (resp.type != MessageType::UNKNOWN) {
+                    // ack other messages
+                    auto ack = createUdpConfirmMessage(resp.msgId);
+                    if (sendto(socketFd, ack.data(), ack.size(), 0,
+                            reinterpret_cast<const sockaddr*>(&serverAddr), sizeof(serverAddr)) < 0) {
+                        perror("sendto confirm");
+                    }
+                    handleIncomingMessage(resp);
+                    if (state == ClientState::TERMINATED) break;
+                }
+            }
+        } else {
+            // timed out -> retransmit
+            attempts++;
+            ssize_t rc = sendto(socketFd, msg.data(), msg.size(), 0, reinterpret_cast<const sockaddr*>(&serverAddr), sizeof(serverAddr));
+            if (rc < 0) perror("sendto");
+            printf_debug("send attempt %d for id=%d, bytes=%zd", attempts + 1, msgId, rc);
         }
     }
-    
+
     if (!confirmed) {
-        printf_debug("Failed to get confirmation for message ID %d after %d attempts", msgId, attempts);
+        printf_debug("Failed to confirm id=%d after %d attempts", msgId, attempts + 1);
         state = ClientState::TERMINATED;
-        fatalError = true;
         return false;
     }
-    
-    // FIX: Return just the confirmation status; do not treat TERMINATED as a success.
-    return confirmed;
-}
-
-// Authenticate with the server - UDP implementation
-bool UdpClient::authenticateWithRetries(const std::string& secret) {
-    // Send AUTH message
-    uint16_t authMsgId = getNextMsgId();
-    std::vector<char> authMsg = createUdpAuthMessage(authMsgId, username, displayName, secret);
-    
-    if (!sendUdpMessage(authMsg, true)) {
-        std::cout << "ERROR: Authentication failed: couldn't get confirmation" << std::endl;
-        fatalError = true;
-        return false;
-    }
-    
-    // Wait for REPLY
-    return awaitReply(authMsgId);
-}
-
-
-void UdpClient::sendProtocolError(const std::string& errorMessage) {
-    uint16_t errId = getNextMsgId();
-    auto errMsg = createUdpErrMessage(errId, displayName, errorMessage);
-    sendto(socketFd, errMsg.data(), errMsg.size(), 0,
-           reinterpret_cast<sockaddr*>(&serverAddr),
-           sizeof(serverAddr));
-}
-
-// Authenticate with the server - UDP implementation
-bool UdpClient::authenticate(const std::string& secret) {
-    return authenticateWithRetries(secret);
-}
-
-// Send a join channel request - UDP implementation
-bool UdpClient::joinChannel(const std::string& channelId) {
-    printf_debug("Attempting to join channel: '%s'", channelId.c_str());
-    uint16_t joinMsgId = getNextMsgId();
-    std::vector<char> joinMsg = createUdpJoinMessage(joinMsgId, channelId, displayName);
-    
-    printf_debug("Created JOIN message with ID %d for channel '%s' as user '%s'", 
-               joinMsgId, channelId.c_str(), displayName.c_str());
-    
-    // Get server address info for logging
-    char serverIpStr[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(serverAddr.sin_addr), serverIpStr, INET_ADDRSTRLEN);
-    printf_debug("Server connection details - IP: %s, Port: %d", 
-               serverIpStr, ntohs(serverAddr.sin_port));
-    
-    if (!sendUdpMessage(joinMsg, true)) {
-        printf_debug("JOIN request failed: couldn't get confirmation for channel: %s (message ID: %d)", 
-                   channelId.c_str(), joinMsgId);
-        fatalError = true;
-        return false;
-    }
-    
-    // Wait for REPLY with 5-second timeout
-    if (!awaitReply(joinMsgId)) {
-        printf_debug("JOIN request failed: no positive REPLY received for channel: %s (message ID: %d)", 
-                   channelId.c_str(), joinMsgId);
-        fatalError = true;
-        return false;
-    }
-    
-    printf_debug("JOIN request successful for channel: %s (message ID: %d)", 
-               channelId.c_str(), joinMsgId);
     return true;
 }
 
-// Send a chat message - UDP implementation
-bool UdpClient::sendChatMessage(const std::string& text) {
+// Send a message to the server and wait for confirmation
+bool UdpClient::authenticate(const std::string& secret) {
     uint16_t id = getNextMsgId();
-    auto datagram = createUdpMsgMessage(id, displayName, text);
-
-    // ask for confirmation & retransmit
-    return sendUdpMessage(datagram, /*requireConfirm=*/true);
-}
-
-// Send BYE message - UDP implementation
-bool UdpClient::sendByeMessage() {
-    printf_debug("[DEBUG-TERM] Attempting to send BYE message");
-    uint16_t byeMsgId = getNextMsgId();
-    std::vector<char> byeMsg = createUdpByeMessage(byeMsgId, displayName);
-    
-    if (sendUdpMessage(byeMsg, true)) {
-        printf_debug("[DEBUG-TERM] BYE message confirmed by server");
-        state = ClientState::TERMINATED;
-        return true;
-    } else {
-        printf_debug("[DEBUG-TERM] Failed to get confirmation for BYE message");
+    auto m = createUdpAuthMessage(id, username, displayName, secret);
+    if (!sendUdpMessage(m, true)) {
+        std::cout << "ERROR: Authentication failed: no confirmation\n";
         fatalError = true;
         return false;
     }
+    return awaitReply(id);
 }
 
-// UDP-specific message handling
-void UdpClient::handleIncomingMessage(const ParsedMessage& msg) {
-    printf_debug("[DEBUG-TERM] Handling message of type %d (before base implementation)", (int)msg.type);
-    
-    // Handle malformed messages (UNKNOWN type)
-    if (msg.type == MessageType::UNKNOWN) {
-        uint16_t errId = getNextMsgId();
-        auto err = createUdpErrMessage(errId, displayName, "Malformed message");
-        sendto(socketFd, err.data(), err.size(), 0,
-               reinterpret_cast<sockaddr*>(&serverAddr),
-               sizeof(serverAddr));
+// Send a JOIN message to the server and wait for confirmation
+bool UdpClient::joinChannel(const std::string& channelId) {
+    uint16_t id = getNextMsgId();
+    auto m = createUdpJoinMessage(id, channelId, displayName);
+    printf_debug("Joining %s (msg %d)", channelId.c_str(), id);
+    if (!sendUdpMessage(m, true)) {
+        fatalError = true;
+        return false;
+    }
+    return awaitReply(id);
+}
+
+// Send a chat message to the server
+bool UdpClient::sendChatMessage(const std::string& text) {
+    uint16_t id = getNextMsgId();
+    auto m = createUdpMsgMessage(id, displayName, text);
+    return sendUdpMessage(m, true);
+}
+
+// Send a BYE message to the server and wait for confirmation
+bool UdpClient::sendByeMessage() {
+    uint16_t id = getNextMsgId();
+    auto m = createUdpByeMessage(id, displayName);
+    if (sendUdpMessage(m, true)) {
         state = ClientState::TERMINATED;
+        return true;
+    }
+    fatalError = true;
+    return false;
+}
+
+// Send a protocol error message to the server without confirmation
+void UdpClient::sendProtocolError(const std::string& err) {
+    uint16_t id = getNextMsgId();
+    auto m = createUdpErrMessage(id, displayName, err);
+    sendUdpMessage(m, /*requireConfirm=*/false);
+}
+
+// Handle incoming UDP messages
+void UdpClient::handleIncomingMessage(const ParsedMessage& msg) {
+    if (msg.type == MessageType::UNKNOWN) {
+        sendProtocolError("Malformed message");
         std::cout << "ERROR: Received malformed message, closing.\n";
-        return; // Skip base implementation
+        state = ClientState::TERMINATED;
+        return;
     }
-    
-    // State before handling
-    ClientState beforeState = state;
-    
-    // Use base class implementation
     Client::handleIncomingMessage(msg);
-    
-    // Check if state changed, especially to TERMINATED
-    if (beforeState != state) {
-        printf_debug("[DEBUG-TERM] State changed from %d to %d after handling message type %d", 
-                    (int)beforeState, (int)state, (int)msg.type);
-    }
-    
-    // Special debug for ERR messages
-    if (msg.type == MessageType::ERR) {
-        printf_debug("[DEBUG-TERM] Received ERR message, client state set to %d (TERMINATED=4)", (int)state);
-        terminationRequested = 1;
-    }
 }
 
 // Wait for a REPLY message with specified reference ID
 bool UdpClient::awaitReply(uint16_t expectedRefId) {
-    // Wait for REPLY message
-    auto startTime = std::chrono::steady_clock::now();
-    
+    // Compute absolute deadline 5 s from now
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(OVERALL_TIMEOUT_MS);
+
     while (state != ClientState::TERMINATED) {
+        // Time left until overall timeout
         auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
-        
-        if (elapsed >= OVERALL_TIMEOUT_MS) {
-            std::cout << "ERROR: No REPLY received within 5 seconds" << std::endl;
+        if (now >= deadline) {
+            std::cout << "ERROR: No REPLY received within 5 seconds\n";
             sendProtocolError("No REPLY in time");
-            state = ClientState::TERMINATED;
+            state      = ClientState::TERMINATED;
             fatalError = true;
             return false;
         }
-        
-        char buffer[1024];
-        sockaddr_in peerAddr;
-        socklen_t peerLen = sizeof(peerAddr);
-        
+
+        // Build timeval for select(): min(100 ms, time left)
+        auto timeLeftMs = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        timeval tv { .tv_sec  = static_cast<long>(std::min<int64_t>(timeLeftMs, 100)), .tv_usec = 0};
+
         fd_set readfds;
-        struct timeval tv;
         FD_ZERO(&readfds);
         FD_SET(socketFd, &readfds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000; // 100ms
-        
-        int ready = select(socketFd + 1, &readfds, NULL, NULL, &tv);
-        
-        if (ready > 0) {
-            ssize_t bytes = recvfrom(socketFd, buffer, sizeof(buffer), 0,
-                                   reinterpret_cast<sockaddr*>(&peerAddr), &peerLen);
-            if (bytes > 0) {
-                // Update server port if needed
-                checkAndUpdateServerPort(peerAddr);
-                
-                // Parse message
-                ParsedMessage response = parseUdpMessage(buffer, bytes);
-                
-                // Always send CONFIRM for any server message
-                if (response.type != MessageType::UNKNOWN && response.type != MessageType::CONFIRM) {
-                    std::vector<char> confirmMsg = createUdpConfirmMessage(response.msgId);
-                    sendto(socketFd, confirmMsg.data(), confirmMsg.size(), 0,
-                          reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
+
+        int ready = select(socketFd + 1, &readfds, nullptr, nullptr, &tv);
+        if (ready <= 0) continue;  // timeout or interrupted, loop again
+
+        // We have data to read
+        sockaddr_in peerAddr;
+        socklen_t peerLen = sizeof(peerAddr);
+        char buf[1024];
+        ssize_t len = recvfrom(socketFd, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&peerAddr), &peerLen);
+        if (len <= 0) continue;  // spurious or error; loop
+
+        checkAndUpdateServerPort(peerAddr);
+        ParsedMessage msg = parseUdpMessage(buf, len);
+
+        // Always ACK non‑UNKNOWN, non‑CONFIRM
+        if (msg.type != MessageType::UNKNOWN && msg.type != MessageType::CONFIRM) {
+            auto ack = createUdpConfirmMessage(msg.msgId);
+            sendto(socketFd, ack.data(), ack.size(), 0,
+                reinterpret_cast<const sockaddr*>(&serverAddr),
+                sizeof(serverAddr));
+        }
+
+        switch (msg.type) {
+            case MessageType::REPLY:
+                if (msg.refMsgId == expectedRefId) {
+                    handleIncomingMessage(msg);
+                    return msg.success;
                 }
-                
-                // Check if it's a REPLY for our message
-                if (response.type == MessageType::REPLY && response.refMsgId == expectedRefId) {
-                    handleIncomingMessage(response);
-                    return response.success; // Return true for OK, false for NOK
-                }
-                else if (response.type == MessageType::ERR) {
-                    // Handle ERR message
-                    handleIncomingMessage(response);
-                    return false; // Failed due to error
-                }
-                else {
-                    // Process other messages
-                    handleIncomingMessage(response);
-                    
-                    // If we transitioned to TERMINATED state, exit
-                    if (state == ClientState::TERMINATED) {
-                        return false;
-                    }
-                }
-            }
+                // else: some other reply—ignore
+                break;
+
+            case MessageType::ERR:
+                handleIncomingMessage(msg);
+                return false;
+
+            default:
+                handleIncomingMessage(msg);
+                // if that drove us to TERMINATED, we’ll exit on next loop check
+                break;
         }
     }
-    
-    return false; // Failed (TERMINATED state or other error)
+
+    // If we broke because state==TERMINATED
+    return false;
 }
 
-// UDP client run loop
-int UdpClient::run() {
-    // Resolve hostname to IP
-    std::vector<std::string> ip_addresses = Client::resolveHostname(serverAddress, false);
-    if (ip_addresses.empty()) {
-        std::cout << "ERROR: Could not resolve any address for host: " << serverAddress << std::endl;
-        return EXIT_FAILURE;
+int UdpClient::handleStdinEvent(std::string& buf) {
+    char tmp[1024];
+    auto n = read(STDIN_FILENO, tmp, sizeof tmp);
+    if (n < 0) return (errno==EAGAIN)? EXIT_SUCCESS : EXIT_FAILURE;
+    if (n == 0) { sendByeAndWaitConfirm(); state = ClientState::TERMINATED; return EXIT_SUCCESS; }
+    buf.append(tmp, n);
+    size_t pos;
+    while ((pos = buf.find('\n')) != std::string::npos) {
+        processUserInput(buf.substr(0,pos));
+        buf.erase(0, pos+1);
+        if (state == ClientState::TERMINATED) return EXIT_FAILURE;
     }
-    
-    // Use the first resolved IP
-    std::string serverIP = ip_addresses[0];
-    
-    // Create UDP socket
+    return EXIT_SUCCESS;
+}
+
+void UdpClient::handleSocketEvent(char* buf) {
+    sockaddr_in peer; socklen_t len = sizeof peer;
+    auto n = recvfrom(socketFd, buf, 65536, 0, (sockaddr*)&peer, &len);
+    if (n <= 0) return;
+    checkAndUpdateServerPort(peer);
+    auto msg = parseUdpMessage(buf, n);
+    if (msg.type == MessageType::CONFIRM) return;
+    sendConfirm(msg.msgId);
+    if (isDuplicate(msg.msgId)) return;
+    seenMsgIds.insert(msg.msgId);
+    handleIncomingMessage(msg);
+}
+
+// Send a CONFIRM back to the server for the given message ID
+void UdpClient::sendConfirm(uint16_t msgId) {
+    auto confirmMsg = createUdpConfirmMessage(msgId);
+    sendto(socketFd, confirmMsg.data(), confirmMsg.size(), 0, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
+}
+
+// Return true if we've already processed this server message ID
+bool UdpClient::isDuplicate(uint16_t msgId) {
+    return seenMsgIds.find(msgId) != seenMsgIds.end();
+}
+
+// Helper to send BYE and wait for its CONFIRM before quitting stdin‐EOF
+void UdpClient::sendByeAndWaitConfirm() {
+    uint16_t byeId = getNextMsgId();
+    auto byeMsg  = createUdpByeMessage(byeId, displayName);
+    // reuse your reliable‐send logic
+    if (!sendUdpMessage(byeMsg, /*requireConfirm=*/true)) {
+        std::cerr << "ERROR: Failed to send BYE or receive confirmation\n";
+    }
+}
+
+// Clean up any resources (mirror what your base destructor does)
+void UdpClient::cleanup() {
+    if (socketFd != -1) {
+        close(socketFd);
+        socketFd = -1;
+    }
+}
+
+// Initialize UDP socket: resolve, bind ephemeral, set serverAddr
+bool UdpClient::initSocket() {
+    auto addrs = resolveHostname(serverAddress);
+    if (addrs.empty()) {
+        std::cout << "ERROR: Could not resolve " << serverAddress << "\n";
+        return false;
+    }
     socketFd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (socketFd < 0) {
-        perror("socket creation failed");
-        return EXIT_FAILURE;
-    }
-    
+    if (socketFd < 0) { perror("socket"); return false; }
     setNonBlocking(socketFd);
-    
-    // Bind to any available port
-    sockaddr_in localAddr;
-    std::memset(&localAddr, 0, sizeof(localAddr));
-    localAddr.sin_family = AF_INET;
-    localAddr.sin_addr.s_addr = INADDR_ANY;
-    localAddr.sin_port = htons(0);
-    if (bind(socketFd, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) < 0) {
-        perror("bind failed");
-        close(socketFd);
-        return EXIT_FAILURE;
+
+    sockaddr_in local;
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_port = htons(0);
+    if (bind(socketFd, (sockaddr*)&local, sizeof local) < 0) {
+        perror("bind"); return false;
     }
-    
-    // Set up server address
-    memset(&serverAddr, 0, sizeof(serverAddr));
+
+    memset(&serverAddr, 0, sizeof serverAddr);
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(serverPort);
-    if (inet_pton(AF_INET, serverIP.c_str(), &serverAddr.sin_addr) <= 0) {
-        std::cout << "ERROR: Invalid server address: " << serverIP << std::endl;
-        close(socketFd);
-        return EXIT_FAILURE;
+    serverAddr.sin_port   = htons(serverPort);
+    if (inet_pton(AF_INET, addrs[0].c_str(), &serverAddr.sin_addr) <= 0) {
+        std::cout << "ERROR: Invalid server IP\n";
+        return false;
     }
-    
-    // Set up epoll for I/O multiplexing
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0) {
-        perror("epoll_create");
-        close(socketFd);
-        return EXIT_FAILURE;
+    return true;
+}
+
+// Setup epoll to watch socket and stdin
+bool UdpClient::setupEpoll() {
+    epollFd = epoll_create1(0);
+    if (epollFd < 0) { 
+        perror("epoll");
+        return false; 
     }
-    
-    // Add socket to epoll
-    epoll_event ev;
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
     ev.events = EPOLLIN;
+
     ev.data.fd = socketFd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socketFd, &ev) < 0) {
-        perror("epoll_ctl: sockfd");
-        close(epoll_fd);
-        close(socketFd);
-        return EXIT_FAILURE;
+    if (epoll_ctl(epollFd, EPOLL_CTL_ADD, socketFd, &ev) < 0) {
+        perror("epoll:add socket"); 
+        return false;
     }
-    
-    // Add stdin to epoll
     setNonBlocking(STDIN_FILENO);
-    epoll_event ev_stdin;
-    ev_stdin.events = EPOLLIN;
-    ev_stdin.data.fd = STDIN_FILENO;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, STDIN_FILENO, &ev_stdin) < 0) {
-        perror("epoll_ctl: stdin");
-        close(epoll_fd);
-        close(socketFd);
-        return EXIT_FAILURE;
+    ev.data.fd = STDIN_FILENO;
+    if (epoll_ctl(epollFd, EPOLL_CTL_ADD, STDIN_FILENO, &ev) < 0) {
+        perror("epoll:add stdin"); 
+        return false;
     }
-    
-    
-    // Main event loop
-    char buffer[65536]; // Large buffer for UDP messages
-    epoll_event events[10];
-    std::string stdinBuffer;
-    bool running = true;
-    
-    while (running) {
-        // Explicit check for TERMINATED state at the beginning of each loop iteration
-        if (state == ClientState::TERMINATED) {
-            printf_debug("[DEBUG-TERM] Client in TERMINATED state, exiting main loop");
-            running = false;
-            break;
-        }
-        
-        // Handle Ctrl+C
+    return true;
+}
+
+// Main event loop: handle stdin and socket until termination
+int UdpClient::eventLoop() {
+    std::array<epoll_event, 16> events;
+    std::string stdinBuf;
+    char udpBuf[65536];
+
+    while (state != ClientState::TERMINATED) {
+        // if requested, send BYE and exit loop
         if (terminationRequested) {
-            printf_debug("[DEBUG-TERM] Termination requested, sending BYE");
-            uint16_t byeMsgId = getNextMsgId();
-            std::vector<char> byeMsg = createUdpByeMessage(byeMsgId, displayName);
-            
-            // Use sendUdpMessage with confirmation to ensure the BYE is received
-            if (sendUdpMessage(byeMsg, true)) {
-                printf_debug("[DEBUG-TERM] BYE message confirmed by server");
-            } else {
-                printf_debug("[DEBUG-TERM] Failed to get confirmation for BYE message");
-            }
+            sendByeAndWaitConfirm();
             break;
         }
-        
-        // Wait for events with a short timeout
-        int nfds = epoll_wait(epoll_fd, events, 10, 100); // 100ms timeout
-        if (nfds == -1) {
+        int n = epoll_wait(epollFd, events.data(), events.size(), 100);
+        if (n < 0) {
             if (errno == EINTR) continue;
-            perror("epoll_wait failed");
-            break;
+            perror("epoll_wait");
+            return EXIT_FAILURE;
         }
-        
-        for (int i = 0; i < nfds; i++) {
-            // Handle socket events
-            if (events[i].data.fd == socketFd) {
-                sockaddr_in peerAddr;
-                socklen_t peerLen = sizeof(peerAddr);
-                ssize_t bytes = recvfrom(socketFd, buffer, sizeof(buffer), 0, 
-                                         reinterpret_cast<sockaddr*>(&peerAddr), &peerLen);
-                if (bytes < 0) {
-                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        perror("recvfrom failed");
-                    }
-                    continue;
-                }
-                
-                // Update server address if different port
-                checkAndUpdateServerPort(peerAddr);
-                
-                // Parse the UDP message
-                ParsedMessage msg = parseUdpMessage(buffer, bytes);
-                printf_debug("[DEBUG-TERM] Received message type %d with ID %d from server in main loop", (int)msg.type, msg.msgId);
-
-                // If it's a CONFIRM message, handle it specially
-                if (msg.type == MessageType::CONFIRM) {
-                    printf_debug("[DEBUG-TERM] Skipping processing for CONFIRM message (refMsgId: %d)", msg.refMsgId);
-                    continue; // Skip normal message processing for CONFIRM messages
-                }
-
-                // For all non-CONFIRM messages, send a CONFIRM response
-                if (msg.type != MessageType::CONFIRM) {
-                    std::vector<char> confirmMsg = createUdpConfirmMessage(msg.msgId);
-                    printf_debug("[DEBUG-TERM] Sending CONFIRM for message ID %d", msg.msgId);
-                    sendto(socketFd, confirmMsg.data(), confirmMsg.size(), 0,
-                           reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
-                    
-                    // Check if we've already seen this message ID
-                    if (seenMsgIds.find(msg.msgId) == seenMsgIds.end()) {
-                        // Check for message ID wrap-around
-                        if (msg.msgId < 1000 && seenMsgIds.size() > 60000) {
-                            // We've likely wrapped around, clear the old IDs
-                            printf_debug("Message ID wrap-around detected, clearing seen IDs cache");
-                            seenMsgIds.clear();
-                        }
-                        
-                        printf_debug("[DEBUG-TERM] Processing message ID %d (type: %d)", msg.msgId, (int)msg.type);
-                        // Not a duplicate - process and track it
-                        seenMsgIds.insert(msg.msgId);
-                        
-                        // Process ALL messages, including UNKNOWN types
-                        handleIncomingMessage(msg);
-                        
-                        if (state == ClientState::TERMINATED) {
-                            printf_debug("[DEBUG-TERM] Client state changed to TERMINATED after processing message ID %d", msg.msgId);
-                            running = false;
-                            break;
-                        }
-                    } else {
-                        printf_debug("[DEBUG-TERM] Ignoring duplicate message with ID: %d (type: %d)", msg.msgId, (int)msg.type);
-                    }
-                }
+        for (int i = 0; i < n; ++i) {
+            int fd = events[i].data.fd;
+            if (fd == socketFd){
+                handleSocketEvent(udpBuf);
+            }      
+            else if (fd == STDIN_FILENO){
+                if (handleStdinEvent(stdinBuf) == EXIT_FAILURE)
+                return EXIT_FAILURE;
             }
-            // Handle stdin events
-            else if (events[i].data.fd == STDIN_FILENO) {
-                char buf[1024];
-                ssize_t bytes = read(STDIN_FILENO, buf, sizeof(buf));
-                if (bytes > 0) {
-                    stdinBuffer.append(buf, bytes);
-                    size_t pos;
-                    while ((pos = stdinBuffer.find('\n')) != std::string::npos) {
-                        std::string line = stdinBuffer.substr(0, pos);
-                        stdinBuffer.erase(0, pos + 1);
-                        
-                        // Process user input
-                        Client::processUserInput(line);
-                        
-                        if (state == ClientState::TERMINATED) {
-                            printf_debug("[DEBUG-TERM] State is TERMINATED after processing user input");
-                            running = false;
-                            break;
-                        }
-                    }
-                }
-                else if (bytes == 0) {
-                    // EOF on stdin, exit gracefully
-                    if (sendByeMessage()) {
-                        printf_debug("BYE message sent and confirmed on EOF");
-                    } else {
-                        printf_debug("Failed to confirm BYE message on EOF");
-                    }
-                    running = false;
-                    break;
-                }
-            }
-        }
-        
-        // Add an extra check at the end of each loop iteration
-        if (state == ClientState::TERMINATED) {
-            printf_debug("[DEBUG-TERM] End of main loop: state is TERMINATED, will break on next iteration");
         }
     }
-    
-    printf_debug("[DEBUG-TERM] UDP client main loop terminated, cleaning up");
-    close(epoll_fd);
     return fatalError ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+
+// Initialize, epoll setup, run loop, then cleanup
+int UdpClient::run() {
+    if (!initSocket()){
+        return EXIT_FAILURE;
+    }      
+    if (!setupEpoll()){
+        return EXIT_FAILURE;
+    }      
+    int rc = eventLoop();
+    cleanup();
+    return rc;
 }
