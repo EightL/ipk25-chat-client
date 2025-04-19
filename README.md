@@ -1,15 +1,24 @@
 # IPK 2024/2025 – Project 2
 
-## Chat‑client for the **IPK25‑CHAT** protocol
+## Chat-client for the **IPK25-CHAT** protocol
 
 - **Author**: Martin Ševčík
 - **login**: `xsevcim00`
 - **Institute**: VUT FIT 2024/2025
 
 
-## Motivation
+## Motivation / How it works
 
 With the first project done, still exhausted from it, I went right onto this second one. The key is to deeply understand whats really happening, especially with the diagrams provided by the specification. Since I had to implement both TCP and UDP variants, I had to understand certain tradeoffs between those two (connetion-oriented vs connectionless, reliability concerns, packet handling, message sending and so on..).
+
+In **IPK25-CHAT protocol** is a **IPv4 line-based chat API** that supports two transport variants:
+- **TCP** is a connection-oriented and reliable byte-stream, where the client and the server exchange CRLF-terminated commands like `AUTH`, `JOIN`, `BYE`, `MSG` and they rely on TCP's built-in ordering, retransmission and flow control.
+
+  ![Client State Machine](/diagrams/tcpMot.svg)
+
+- **UDP** is a connectionless datagram model and the communication between client and server is established with packets. Each packet has a 3-byte header (`Type`, `MessageID`). UDP is pretty unreliable so the client needs to confirm these packets with `CONFIRM` ACKs, unique message IDs, duplicate handling, dynamic server port handling to make sure that the connection and the sequencing is reliable.
+
+  ![Client State Machine](/diagrams/udpMot.svg)
 
 ## Overview
 
@@ -17,27 +26,33 @@ This project implements a CLI chat client, that includes both TCP and UDP versio
 
 ### Key choices:
 
-- `epoll` for low‑overhead I/O.
-- A single finite‑state machine in an abstract `Client` class, with separate `TcpClient` and `UdpClient` subclasses.
+- `epoll` for low-overhead I/O.
+- A single finite-state machine in an abstract `Client` class, with separate `TcpClient` and `UdpClient` subclasses.
 - Pure **C++20**, no outside dependencies
 - **std::regex** for cleaner input validations
 
+## Chosen Programming Language
+
+This project is implemented in **C++20**, mainly for features like `enum class`, `<chrono>` utilities, and stronger constexpr. But also uses stuff like  `std::string`/`std::vector` for resource and buffer management, which goes back to C++11.
+
+I stuck with C++ because I'm taking a C++ course this semester, so it aligned nicely. Plus, having done the first project in C++, I was able to reuse and improve patterns I learned in the first project.
+
 ---
 
-## How it works
+## How my implementation works:
 
-1. **Initialization**: `main.cpp` parses command‑line arguments with the help of `parseArgs` function, inits `signalHandler` for graceful termination and then uses `createClient()` to build either `TcpClient` or `UdpClient` depending on which we chose with `-t`.
+1. **Initialization**: `main.cpp` parses command-line arguments with the help of `parseArgs` function, inits `signalHandler` for graceful termination and then uses `createClient()` to build either `TcpClient` or `UdpClient` depending on which we chose with `-t`.
 2. **Setup**: 
-    - **TCP**: In `TcpClient::run()`, after a successful connection, we set the socket to non-blocking (`STDFILENO`) and then register them with `epoll`.
-    - **UDP**: In `UdpClient::initSocket()` we get ephemeral port also make the socket non-blocking, and add the socket with `STDIN_FILENO` to `epoll`.
+    - **TCP**: In `TcpClient::run()`, after a successful connection, we set the socket to non-blocking and then register them with `epoll`.
+    - **UDP**: In `UdpClient::initSocket()` we get ephemeral port also make the socket non-blocking, and add the socket to `epoll`.
 3. **Event loop**:
    - **Stdin events**: The main loop listens for input lines. If they start with `/` -> they're  parsed into `/auth`, `/join`, `/rename`, `/bye`, or `/help` commands; else they are sent as chat messages.
    - **Socket events**:
-     - **TCP**: Bytes are read into a buffer, complete `\r\n`‑terminated frames are extracted, and `parseTcpMessage()` is handled with `handleIncomingMessage()`.
+     - **TCP**: Bytes are read into a buffer, complete `\r\n`-terminated frames are extracted, and `parseTcpMessage()` is handled with `handleIncomingMessage()`.
      - **UDP**: Packets are received via `recvfrom()`, parsed with `parseUdpMessage()`, we check for duplicit ID's, and a **CONFIRM** is sent for each valid packet, then we dispatch it to `handleIncomingMessage()`.
 4. **State machine & reliability**: 
      - **Valid transitions** (INIT -> AUTHENITCATING -> ...) are handled by `ClientState`. 
-     - **UDP reliability**: every outbound packet is tagged by `getNextMsgId()`, sent via `sendUdpMessage()` which loops (initial send + up to N retries) until it sees a matching **CONFIRM**, then `awaitReply()` waits up to 5 s for a positive **REPLY** before giving up ​
+     - **UDP reliability**: every outbound packet is tagged by `getNextMsgId()`, sent via `sendUdpMessage()` which loops (initial send + up to N retries) until it sees a matching **CONFIRM**, then `awaitReply()` waits up to 5 s for a positive **REPLY** before giving up
 
 
 ---
@@ -49,11 +64,6 @@ This project implements a CLI chat client, that includes both TCP and UDP versio
 
 While designinng this finite state machine, i was mainly following the FSM in the specification and enhanced it with some tweaks. This FSM is implemented in `client.cpp` and both TCP and UDP follow this. The client starts in `INIT`, transitions to `AUTHENTICATING` on /auth, and if successful reaches `JOINED` state. From there, it can either send messages in the current channel or enter `JOIN_WAITING` to switch channels. The `TERMINATED` state is a one-way exit - once we're there, we close the socket & exit. All error paths should be providing graceful fallbacks.
 
-## Chosen Programming Language
-
-This project is implemented in **C++20**, mainly for features like `enum class`, `<chrono>` utilities, and stronger constexpr. But also uses stuff like  `std::string`/`std::vector` for resource and buffer management, which goes back to C++11.
-
-I stuck with C++ because I’m taking a C++ course this semester, so it aligned nicely. Plus, having done the first project in C++, I was able to reuse and improve patterns I learned in the first project.
 
 ---
 
@@ -71,7 +81,7 @@ make debug  # with debug prints
 ./ipk25chat-client -t <tcp|udp> -s <server> [options]
 ```
 
-### Command‑line Options
+### Command-line Options
 ```
 -t <tcp|udp>        Transport protocol (tcp or udp)
 -s <server>         Server IP or hostname
@@ -126,19 +136,18 @@ The class diagram shows how I structured the codebase. The abstract `Client` cla
 ### Client base class (`client.h` / `client.cpp`)
 
 - **State & Identity**: Tracks `ClientState`, `username`, `displayName`, and `channelID`.  
-- **Non‑blocking I/O**: `setNonBlocking(fd)` wraps `fcntl` so neither socket nor stdin ever block.  
+- **Non-blocking I/O**: I use `setNonBlocking(fd)`.  
 - **DNS**: `resolveHostname()` uses `getaddrinfo()` + `inet_ntop()` to turn names into IPv4 strings.  
-- **FSM guard**: `isValidTransition()` rejects out‑of‑order messages.  
-- **Validation**: I use helpers like `isValidUsername()` and `isValidMessageContent()` rely on things like `std::regex` for validation.  
-- **Input dispatch**: `processUserInput()` splits slash‑commands to `handleAuth()`, `handleJoin()`, `handleRename()`, `handleChat()`, or prints an error for anything unknown.
+- **FSM guard**: `isValidTransition()` checks if messages are out of order. 
+- **Validation**: I use helpers like `isValidUsername()` and `isValidMessageContent()` that rely on things like `std::regex` for validation.  
+- **Input dispatch**: `processUserInput()` splits `/` commands to `handleAuth()`, `handleJoin()`, `handleRename()`, `handleChat()`, or prints an error for anything unknown.
 
 ### Message utilities (`message.h` / `message.cpp`)
 
-
-- **ParsedMessage**: Carries `type`, up to three `param` strings, plus `msgId`/`refMsgId` and a `success` flag.  
-- **TCP**: `createTcpMessage()` build CRLF‑terminated commands; `parseTcpMessage()` uses an `istringstream` + `expectToken()` for robust parsing.  
-- **UDP**: `createUdpMessage()` pushes a `uint8_t` type, `pushNet16()` for the ID, then null‑terminated fields into a `std::vector<char>`.  
-- **Parsing**: `parseUdpMessage()` peels off the 3‑byte header, switches on `type`, and uses `strnlen()` to locate each string.
+- **ParsedMessage**: Has `type`, up to three `param` strings and `msgId`/`refMsgId` and also a `success` flag.  
+- **TCP**: `createTcpMessage()` build CRLF-terminated commands; `parseTcpMessage()` uses an `istringstream` + `expectToken()` for robust parsing.  
+- **UDP**: `createUdpMessage()` pushes a `uint8_t` type, `pushNet16()` for the ID, then null-terminated fields into a `std::vector<char>`.  
+- **Parsing**: `parseUdpMessage()` handles the 3-byte header, switches on `type`, and uses `strnlen()` to locate each string.
 
 ### TcpClient (`tcp_client.h` / `tcp_client.cpp`)
 
@@ -150,8 +159,8 @@ This diagram shows how the TCP client extends the base FSM with some specific su
 - **Epoll**: Calls `epoll_create1()`, adds `socketFd` and `STDIN_FILENO`, then loops on `epoll_wait()`.
 - **Sending**: `sendMessage()` handles partial writes until the entire string is sent.
 - **Receiving**: `processSocketInput(buffer)` reads into `buffer`, splits complete messages, then `parseTcpMessage()`.
-- **Timeouts**: On `authenticate()` and `joinChannel()`, sets `waitingForReply = true` with a `replyDeadline` 5 s later. On each epoll cycle, the timeout value shrinks, and missing a reply triggers `ERR` + BYE.
-- **Clean exit**: On user Ctrl+C (`terminationRequested`), calls `sendByeMessage()`, then lets TCP’s FIN/ACK handle the graceful close.
+- **Timeouts**: On `authenticate()` and `joinChannel()`, sets `waitingForReply = true` with a `replyDeadline` 5s later. Missing a reply triggers `ERR` + `BYE`.
+- **Clean exit**: On Ctrl+C (`terminationRequested`) or EOF, calls `sendByeMessage()`, then lets TCP's FIN/ACK handle the graceful close.
 
 ### UdpClient (`udp_client.h` / `udp_client.cpp`)
 
@@ -159,11 +168,11 @@ This diagram shows how the TCP client extends the base FSM with some specific su
 
 This diagram shows the UDP client implementation. It has the same high-level states but adds reliable delivery via a custom confirm/retry protocol. Every outbound message gets a unique ID, and we use `select()` with timeouts to wait for confirmations. We handle duplicates and out-of-order messages aswell(dotted parts). We bind the port to 0 and update the server port after the first **CONFIRM**. We also have explicit handling for dropped packets with retransmissions.
 
-- **Socket & bind**: `initSocket()` picks an ephemeral port so multiple clients don't collide.  
-- **Port dance**: `checkAndUpdateServerPort()` adjusts to the server’s dynamic port once we get the first CONFIRM.  
-- **Message IDs**: `getNextMsgId()` hands out unique 16‑bit IDs.  
-- **Reliable send**: `sendUdpMessage(msg, true)` loops on `select()` with `timeoutMs` until it sees a matching CONFIRM or exhausts `maxRetransmissions`.  
-- **REPLY wait**: `awaitReply(refId)` waits upto 5s, ACKs any non‑CONFIRM messages along the way, and returns the `success` flag.  
+- **Socket & bind**: `initSocket()` picks a temporary port so multiple clients don't collide.  
+- **Port dance**: `checkAndUpdateServerPort()` adjusts to the server's dynamic port once we get the first CONFIRM.  
+- **Message IDs**: `getNextMsgId()` gives unique 16-bit IDs.  
+- **Reliable send**: `sendUdpMessage(msg, true)` loops on `select()` with `timeoutMs` until it sees a matching CONFIRM or if `maxRetransmissions` is no more.  
+- **REPLY wait**: `awaitReply(refId)` waits upto 5s, ACKs any non-CONFIRM messages along the way, and returns the `success` flag.  
 - **Dup suppression**: `seenMsgIds` drops repeats immediately.
 
 ---
@@ -210,11 +219,11 @@ This project is licensed under the [GNU GPL v3.0](LICENSE).
 
 ## Testing
 
-### Testing environments
+#### Testing environments
 
 I tested this both on my WSL aswell as the refference VM.
 
-### A Testing with my custom server
+## A Testing with my custom server
 For this part, I created a custom python server that simulates the IPK25-CHAT protocol for TCP and UDP. It handles all message types from specification and provides debug logs to see if everything went well. And it echoes back my messages with the correct display name.
 - You can find this server implementation in my github in `project_utils` directory.
 
@@ -224,11 +233,11 @@ On another terminal:
 python3 server.py -t [tcp/udp] -p [port]
 ```
 
-#### A.1 Basic CLI Behavior
+### A.1 Basic CLI Behavior
 
 I'm testing this to ensure that the help output and argument validation works even before any network interactions.
 
-##### A.1.1 Print help
+### A.1.1 Print help
 - **Input:**  
 ```bash
 ./ipk25chat-client -h
@@ -252,7 +261,7 @@ Optional arguments:
 -h                Display this help message and exit
 ```
 
-##### A.1.2 Missing required arguments
+### A.1.2 Missing required arguments
 **Input:**  
   ```bash
   ./ipk25-chat -t tcp
@@ -267,11 +276,11 @@ Optional arguments:
 
 ---
 
-#### A.2 TCP Functional Tests
+### A.2 TCP Functional Tests
 
 Im testing this to verify the complete TCP handshake, the message exchanging and graceful shutting down.
 
-##### A.2.1 Successful authentication
+### A.2.1 Successful authentication
 **Input:**  
 ```bash
 ./ipk25chat-client -t tcp -s 127.0.0.1 -p 4567
@@ -291,7 +300,7 @@ Action Success: Auth success.
 Server: martin has joined default.
 ```
 
-##### A.2.2 Graceful termination
+### A.2.2 Graceful termination
 **Input:**  
 Same as above, then:
 - do `ctr+d`
@@ -312,7 +321,7 @@ Client sends BYE and exits without errors (exit 0).
 - on user side, nothing else gets outputted
 ---
 
-##### A.2.3 Chat help commands
+### A.2.3 Chat help commands
 **Input:**  
 Same as above, then:
 ```bash
@@ -331,7 +340,7 @@ available commands:
 ```
 
 
-##### A.2.4 Renaming
+### A.2.4 Renaming
 **Input:**  
 Same as above + write some messages, then:
 ```bash
@@ -359,7 +368,7 @@ hello
 martin: hello
 ```
 
-##### A.2.4 Joining another server
+### A.2.4 Joining another server
 **Input:**  
 Same as above, then
 ```bash
@@ -376,7 +385,7 @@ Server: martin has joined channel2.
 Action Success: Join success.
 ```
 
-##### A.2.4 Malformed message handling
+### A.2.4 Malformed message handling
 
 Testing this to ensure that the client detects and reports protocol errors
 
@@ -409,11 +418,11 @@ Debug output from server:
 ---
 
 
-#### A.3 UDP Functional Tests
+### A.3 UDP Functional Tests
 
 Testing this to validate the UDP workflow, retransmissions and confirms.
 
-##### A.3.1 Successful authentication
+### A.3.1 Successful authentication
 **Input:**  
 ```bash
 ./ipk25chat-client -t udp -s 127.0.0.1 -p 4567
@@ -433,7 +442,7 @@ Action Success: Auth success.
 Server: martin has joined default.
 ```
 
-##### A.3.2 Graceful termination
+### A.3.2 Graceful termination
 **Input:**  
 Same as above, then:
 - do `ctr+d`
@@ -458,7 +467,7 @@ Client sends BYE and exits without errors (exit 0).
 - on user side, nothing else gets outputted
 ---
 
-##### A.3.3 Chat help commands
+### A.3.3 Chat help commands
 **Input:**  
 Same as above, then:
 ```bash
@@ -477,7 +486,7 @@ available commands:
 ```
 
 
-##### A.3.4 Renaming
+### A.3.4 Renaming
 **Input:**  
 Same as above + write some messages, then:
 ```bash
@@ -505,7 +514,7 @@ hello
 martin: hello
 ```
 
-##### A.3.5 Joining another server
+### A.3.5 Joining another server
 **Input:**  
 Same as above, then
 ```bash
@@ -522,7 +531,7 @@ Server: martin has joined channel2.
 Action Success: Join success.
 ```
 
-##### A.3.6 Malformed message handling
+### A.3.6 Malformed message handling
 **Precondition:**
 I altered my server send `b'\x04\x00'` after the user AUTHs
 
@@ -542,7 +551,7 @@ ERROR: Received invalid message from server.
 ERROR: Received malformed message, closing.
 Action Success: Auth success.
 ```
-Debug output from server:
+Debug output from my server:
 ```bash
 2025-04-18 19:15:11 [DEBUG] [PARSE] type=0xFE id=2 payload_len=25
 2025-04-18 19:15:11 [DEBUG] [ID_GEN] -> 0
@@ -554,9 +563,9 @@ Debug output from server:
 ### B. Testing Using Netcat
 To make sure the client is robust, I'm also trying some tests on Netcat.
 
-#### B.1 Basic Functionality
+### B.1 Basic Functionality
 
-#### B.2 TCP Malformed message
+### B.2 TCP Malformed message
 **First:**
 Open a server on other terminal:
 ```bash
@@ -585,7 +594,7 @@ Action Success: Auth success.
 ERROR: Received invalid message from server.
 ```
 
-#### B.2 TCP/UDP No Reply
+### B.2 TCP/UDP No Reply
 **First:**
 Open a server on other terminal:
 ```bash
@@ -616,9 +625,9 @@ ERROR: No REPLY in 5s
 
 ### C. Testing with tcpdump
 
-Testing this to ensure on‑the‑wire packets match the protocol framing and content.
+Testing this to ensure on-the-wire packets match the protocol framing and content.
 
-#### C.1 TCP Capture
+### C.1 TCP Capture
 **Precondition:**
 On one terminal:
 ```bash
@@ -653,7 +662,7 @@ Lines indicating packets
 ...
 
 ```
-#### C.2 UDP Capture
+### C.2 UDP Capture
 **Precondition:**
 On one terminal:
 ```bash
@@ -729,5 +738,5 @@ During my implementation of this project, I mainly used the discord server `anto
 ### Additional Notes:
 All diagrams were created with PlantUML
 
-- **PlantUML** – Open‑source tool to draw UML and other diagrams from plain text.  
+- **PlantUML** – Open-source tool to draw UML and other diagrams from plain text.  
   https://plantuml.com/

@@ -2,7 +2,7 @@
  * @file message.h
  * @brief Message types and utilities for the IPK25-CHAT protocol
  *
- * Defines binary type values, protocol‑agnostic enums, parsing structures,
+ * Defines binary type values, protocol-agnostic enums, parsing structures,
  * and functions to serialize/deserialize messages for both TCP and UDP.
  *
  * @author xsevcim00
@@ -28,7 +28,7 @@ const uint8_t BYE_TYPE     = 0xFF;
 /**
  * @brief Message type enumeration for IPK25-CHAT
  *
- * Protocol‑agnostic representation of all message kinds.
+ * Protocol-agnostic representation of all message kinds.
  */
 enum class MessageType {
     AUTH, 
@@ -98,7 +98,7 @@ std::string createTcpByeMessage(const std::string& displayName);
 
 /**
  * @brief Parse a TCP message into a structure
- * @param raw raw CRLF‑terminated message
+ * @param raw raw CRLF-terminted message
  * @return parsed message
  */
 ParsedMessage parseTcpMessage(const std::string& raw);

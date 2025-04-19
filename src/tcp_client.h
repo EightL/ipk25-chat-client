@@ -16,8 +16,8 @@
 /**
  * @brief TCP client implementation for the IPK25-CHAT protocol
  *
- * Handles connection establishment, text-based framing (CRLF‑terminated messages),
- * reliable delivery via built‑in TCP mechanisms, and an event‑driven loop.
+ * Handles connection establishment, text-based framing (CRLF-terminated messages),
+ * reliable delivery via built-in TCP mechanisms, and an event-driven loop.
  */
 class TcpClient : public Client {
 private:
@@ -41,7 +41,7 @@ private:
     bool sendMessage(const std::string& msg);
 
     /**
-     * @brief Read available socket data, extract complete CRLF‑terminated messages
+     * @brief Read available socket data, extract complete CRLF-terminated messages
      * @param buffer Accumulates partial reads between calls
      */
     void processSocketInput(std::string& buffer);

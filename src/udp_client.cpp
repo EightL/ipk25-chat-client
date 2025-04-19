@@ -209,7 +209,7 @@ void UdpClient::handleIncomingMessage(const ParsedMessage& msg) {
 
 // Wait for a REPLY message with specified reference ID
 bool UdpClient::awaitReply(uint16_t expectedRefId) {
-    // Compute absolute deadline 5 s from now
+    // Compute absolute deadline 5s from now
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(OVERALL_TIMEOUT_MS);
 
     while (state != ClientState::TERMINATED) {
@@ -223,7 +223,7 @@ bool UdpClient::awaitReply(uint16_t expectedRefId) {
             return false;
         }
 
-        // Build timeval for select(): min(100 ms, time left)
+        // Build timeval for select(): min(100ms, time left)
         auto timeLeftMs = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
         timeval tv { .tv_sec  = static_cast<long>(std::min<int64_t>(timeLeftMs, 100)), .tv_usec = 0};
 
@@ -244,7 +244,7 @@ bool UdpClient::awaitReply(uint16_t expectedRefId) {
         checkAndUpdateServerPort(peerAddr);
         ParsedMessage msg = parseUdpMessage(buf, len);
 
-        // Always ACK non‑UNKNOWN, non‑CONFIRM
+        // Always ACK non-UNKNOWN, non-CONFIRM
         if (msg.type != MessageType::UNKNOWN && msg.type != MessageType::CONFIRM) {
             auto ack = createUdpConfirmMessage(msg.msgId);
             sendto(socketFd, ack.data(), ack.size(), 0,
@@ -267,7 +267,7 @@ bool UdpClient::awaitReply(uint16_t expectedRefId) {
 
             default:
                 handleIncomingMessage(msg);
-                // if that drove us to TERMINATED, we’ll exit on next loop check
+                // if that drove us to TERMINATED, we'll exit on next loop check
                 break;
         }
     }
@@ -315,12 +315,12 @@ bool UdpClient::isDuplicate(uint16_t msgId) {
     return seenMsgIds.find(msgId) != seenMsgIds.end();
 }
 
-// Helper to send BYE and wait for its CONFIRM before quitting stdin‐EOF
+// Helper to send BYE and wait for its CONFIRM before quitting stdin-EOF
 void UdpClient::sendByeAndWaitConfirm() {
     uint16_t byeId = getNextMsgId();
     auto byeMsg  = createUdpByeMessage(byeId, displayName);
-    // reuse your reliable‐send logic
-    if (!sendUdpMessage(byeMsg, /*requireConfirm=*/true)) {
+    // reuse your reliable-usend logic
+    if (!sendUdpMessage(byeMsg, true)) {
         std::cerr << "ERROR: Failed to send BYE or receive confirmation\n";
     }
 }
