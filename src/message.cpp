@@ -15,18 +15,29 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <regex>
+#include <algorithm>
+#include <cctype>
+
+// ===================================== Message Type Utilities ======================================== //
+
 
 // Map a text token to its MessageType enum
 MessageType stringToMessageType(const std::string& token) {
-    if (token == "AUTH")  return MessageType::AUTH;
-    if (token == "JOIN")  return MessageType::JOIN;
-    if (token == "MSG")   return MessageType::MSG;
-    if (token == "BYE")   return MessageType::BYE;
-    if (token == "REPLY") return MessageType::REPLY;
-    if (token == "ERR")   return MessageType::ERR;
+    // I think it should be insensitive
+    std::string up = token;
+    std::transform(up.begin(), up.end(), up.begin(), [](unsigned char c){ return std::toupper(c); });
+    if (up == "AUTH")  return MessageType::AUTH;
+    if (up == "JOIN")  return MessageType::JOIN;
+    if (up == "MSG")   return MessageType::MSG;
+    if (up == "BYE")   return MessageType::BYE;
+    if (up == "REPLY") return MessageType::REPLY;
+    if (up == "ERR")   return MessageType::ERR;
     // Fallback when unrecognized
     return MessageType::UNKNOWN;
 }
+
+// ===================================== TCP Message Creation ======================================== //
+
 
 // Build a TCP AUTH command string
 std::string createTcpAuthMessage(const std::string& username, const std::string& displayName, const std::string& secret) {
@@ -52,20 +63,32 @@ std::string createTcpByeMessage(const std::string& displayName) {
     return "BYE FROM " + displayName + "\r\n";
 }
 
+// ===================================== TCP Message Parsing ======================================== //
+
+
 // Helper fucntion for parseTcpMessage - expect a specific literal token from an istringstream
 static bool expectToken(std::istringstream& iss, const std::string& lit) {
     std::string t;
+    if (!(iss >> t)) {
+        return false;
+    }
+    std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c){ 
+        return std::toupper(c); 
+    });
     // read next token and compare
-    return (iss >> t) && t == lit;
+    return t == lit;
 }
 
 // Trim leading/trailing spaces and newlines from a string
 static std::string trim(const std::string& s) {
     auto start = s.find_first_not_of(" \r\n");
-    if (start == std::string::npos) return ""; // all whitespace
-    auto end   = s.find_last_not_of(" \r\n");
+    if (start == std::string::npos) {
+        return ""; // all whitespace
+    }
+    auto end = s.find_last_not_of(" \r\n");
     return s.substr(start, end - start + 1);
 }
+
 
 // Parse a raw TCP line into a ParsedMessage
 ParsedMessage parseTcpMessage(const std::string& raw) {
@@ -86,7 +109,7 @@ ParsedMessage parseTcpMessage(const std::string& raw) {
     switch (msg.type) {
         case MessageType::AUTH:
             // AUTH <user> AS <display> USING <secret>
-            if (!(iss >> msg.param1)          // username
+            if (!(iss >> msg.param1)        // username
             || !expectToken(iss, "AS")      // literal AS
             || !(iss >> msg.param2)         // displayName
             || !expectToken(iss, "USING"))  // literal USING
@@ -131,12 +154,16 @@ ParsedMessage parseTcpMessage(const std::string& raw) {
             break;
 
         case MessageType::REPLY:
-            // REPLY <OK|NOK> IS <content>
-            if (!(iss >> token)) {           // OK/NOK
+            // REPLY <OK|NOK> IS <content> (OK/NOK must be case-insensitive)
+            if (!(iss >> token)) { 
                 msg.type = MessageType::UNKNOWN;
                 break;
             }
-            msg.success = (token == "OK");
+            {
+                std::string up = token;
+                std::transform(up.begin(), up.end(), up.begin(), [](unsigned char c){ return std::toupper(c); });
+                msg.success = (up == "OK");
+            }
             if (!expectToken(iss, "IS")) {   // literal IS
                 msg.type = MessageType::UNKNOWN;
                 break;
@@ -165,6 +192,9 @@ ParsedMessage parseTcpMessage(const std::string& raw) {
 
     return msg;
 }
+
+// ===================================== UDP Message Parsing ======================================== //
+
 
 // Parse a raw UDP packet buffer into a ParsedMessage
 ParsedMessage parseUdpMessage(const char* buffer, size_t length) {
@@ -256,12 +286,16 @@ ParsedMessage parseUdpMessage(const char* buffer, size_t length) {
     return msg;
 }
 
+// ===================================== UDP Message Creation ======================================== //
+
+
 // Helper to push a 16-bit network-order ID into a vector
 static void pushNet16(std::vector<char>& v, uint16_t value) {
     uint16_t net = htons(value);
     v.push_back(reinterpret_cast<char*>(&net)[0]);
     v.push_back(reinterpret_cast<char*>(&net)[1]);
 }
+
 
 // Serialize an AUTH message into UDP binary form
 std::vector<char> createUdpAuthMessage(uint16_t msgId, const std::string& username, const std::string& displayName, const std::string& secret) {

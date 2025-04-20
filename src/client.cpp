@@ -2,9 +2,10 @@
  * @file client.cpp
  * @brief Implementation of the base Client class for the IPK25-CHAT protocol
  *
- * This file implements the core functionality shared by both tcp and udp clients,
- * including user input processing, message validation, and state management.
- *
+ * This file implements the base Client class, which has the core functionality for both
+ * TCP and UDP clients, which they can build on. It handles user input processing,
+ * message validation and state management.
+ * 
  * @author xsevcim00
  */
 
@@ -22,6 +23,10 @@
 
 static constexpr size_t MAX_MSG_CONTENT = 60000;   // max message body size
 static constexpr size_t MAX_DISPLAY_NAME = 20;     // max length for display name
+
+
+
+// ===================================== Validation helper functions =================================== //
 
 // Ceneric helper: checks length and regex match for various fields
 bool validateString(const std::string& str, const std::regex& pattern, size_t maxLength) {
@@ -59,6 +64,8 @@ bool isValidMessageContent(const std::string& messageContent) {
     return validateString(messageContent, MESSAGE_PATTERN, MAX_MSG_CONTENT);
 }
 
+// ===================================== Client implementation ======================================== //
+
 // Constructor: pick udp or tcp and start in INIT state
 Client::Client(bool isUdpClient) : isUdp(isUdpClient) {
     state = ClientState::INIT;
@@ -70,6 +77,12 @@ Client::~Client() {
         close(socketFd);
         socketFd = -1;
     }
+}
+
+// Set client identity parameters (user, display) before auth
+void Client::setIdentity(const std::string& user, const std::string& display) {
+    username = user;
+    displayName = display;
 }
 
 // Make a socket non-blocking so epoll/select won't hang
@@ -158,27 +171,6 @@ std::vector<std::string> Client::resolveHostname(const std::string& hostname) {
 
     freeaddrinfo(result);
     return addrs;
-}
-
-// Check if a received message type is allowed in the current state
-bool Client::isValidTransition(MessageType msgType) {
-    switch (state) {
-    case ClientState::INIT:
-    case ClientState::TERMINATED:
-        // init or after end, nothing should come in
-        return false;
-
-    case ClientState::AUTHENTICATING:
-        // during auth, expect only reply, err, or bye
-        return msgType == MessageType::REPLY || msgType == MessageType::ERR || msgType == MessageType::BYE;
-
-    case ClientState::JOINED:
-    case ClientState::JOIN_WAITING:
-        // once in a channel, chat, replies, errors, or bye
-        return msgType == MessageType::MSG || msgType == MessageType::REPLY ||
-            msgType == MessageType::ERR || msgType == MessageType::BYE;
-    }
-    return false; // shouldn't reach here
 }
 
 // Handle the /auth command: parse args and send auth message
@@ -282,9 +274,7 @@ void Client::handleHelp() {
 void Client::handleChat(const std::string& message) {
     if (state != ClientState::JOINED) {
         // can't chat until we're in a channel
-        std::cout << (state == ClientState::INIT
-                    ? "ERROR: You must authenticate first.\n"
-                    : "ERROR: You must join a channel before sending messages.\n");
+        std::cout << (state == ClientState::INIT ? "ERROR: You must authenticate first.\n" : "ERROR: You must join a channel before sending messages.\n");
         return;
     }
 
@@ -312,7 +302,7 @@ void Client::processUserInput(const std::string& input) {
         std::string cmd;
         iss >> cmd;
 
-        if (cmd == "auth")      handleAuth(iss);
+        if (cmd == "auth") handleAuth(iss);
         else if (cmd == "join") handleJoin(iss);
         else if (cmd == "rename") handleRename(iss);
         else if (cmd == "bye")   sendByeMessage();
@@ -325,6 +315,28 @@ void Client::processUserInput(const std::string& input) {
         // otherwise, just chat
         handleChat(input);
     }
+}
+
+// ===================================== State management ======================================== //
+
+// Check if a received message type is allowed in the current state
+bool Client::isValidTransition(MessageType msgType) {
+    switch (state) {
+    case ClientState::INIT:
+    case ClientState::TERMINATED:
+        // init or after end, nothing should come in
+        return false;
+
+    case ClientState::AUTHENTICATING:
+        // during auth, expect only reply, err, or bye
+        return msgType == MessageType::REPLY || msgType == MessageType::ERR || msgType == MessageType::BYE;
+
+    case ClientState::JOINED:
+    case ClientState::JOIN_WAITING:
+        // once in a channel, chat, replies, errors, or bye
+        return msgType == MessageType::MSG || msgType == MessageType::REPLY || msgType == MessageType::ERR || msgType == MessageType::BYE;
+    }
+    return false; // shouldn't reach here
 }
 
 // Process messages from server, update state or display
@@ -341,11 +353,9 @@ void Client::handleIncomingMessage(const ParsedMessage& msg) {
     switch (msg.type) {
         case MessageType::REPLY: {
             // show success/failure chatty text
-            std::cout 
-            << (msg.success ? "Action Success: " : "Action Failure: ")
-            << msg.param2 << "\n";
+            std::cout  << (msg.success ? "Action Success: " : "Action Failure: ") << msg.param2 << "\n";
 
-            // if we were authenticating, move to joined on ok
+            // if we were authenticating, move to joined on OK
             if (state == ClientState::AUTHENTICATING) {
                 state = msg.success ? ClientState::JOINED : ClientState::INIT;
             }
@@ -384,8 +394,4 @@ void Client::handleIncomingMessage(const ParsedMessage& msg) {
     }
 }
 
-// Set client identity parameters (user, display) before auth
-void Client::setIdentity(const std::string& user, const std::string& display) {
-    username = user;
-    displayName = display;
-}
+

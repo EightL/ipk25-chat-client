@@ -29,6 +29,8 @@ extern volatile sig_atomic_t terminationRequested;
 
 const int OVERALL_TIMEOUT_MS = 5000; // 5 seconds overall timeout
 
+// ===================================== Constructors & Destructors ======================================== //
+
 // Initialize UDP client with server details and transmission parameters
 UdpClient::UdpClient(const std::string& serverIp, int port, uint16_t timeout, uint8_t retransmissions) 
         : Client(true), serverAddress(serverIp), serverPort(port), timeoutMs(timeout), maxRetransmissions(retransmissions) {
@@ -38,6 +40,8 @@ UdpClient::UdpClient(const std::string& serverIp, int port, uint16_t timeout, ui
 UdpClient::~UdpClient() {
     // Base destructor handles socket cleanup
 }
+
+// ===================================== Message ID & Server Management ======================================== //
 
 // Generate a new unique message ID
 uint16_t UdpClient::getNextMsgId() {
@@ -58,14 +62,15 @@ void UdpClient::checkAndUpdateServerPort(const sockaddr_in& peerAddr) {
 // Check if the overall timeout has been exceeded
 static bool overallTimeoutExceeded(const std::chrono::steady_clock::time_point& start) {
     constexpr int OVERALL_MS = 5000;
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start
-    ).count();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
     return elapsed >= OVERALL_MS;
 }
 
+// ===================================== Message Transmission ======================================== //
+
 // Send a UDP message, optionally requiring confirmation
 bool UdpClient::sendUdpMessage(const std::vector<char>& msg, bool requireConfirm) {
+    // simple case: unreliable send, no confirmation needed
     if (!requireConfirm) {
         ssize_t sent = sendto(socketFd, msg.data(), msg.size(), 0, reinterpret_cast<const sockaddr*>(&serverAddr), sizeof(serverAddr));
         if (sent < 0) perror("sendto");
@@ -73,64 +78,72 @@ bool UdpClient::sendUdpMessage(const std::vector<char>& msg, bool requireConfirm
         return sent >= 0;
     }
 
-    // Reliable send: initial + retries
+    // extract the message ID from the packet for tracking confirmations
     uint16_t msgId = 0;
     if (msg.size() >= 3) {
         memcpy(&msgId, &msg[1], 2);
-        msgId = ntohs(msgId);
+        msgId = ntohs(msgId);  // convert from network byte order
     }
-    int attempts = 0;
-    bool confirmed = false;
-    auto start = std::chrono::steady_clock::now();
+    int attempts = 0;  // track retransmission count
+    bool confirmed = false;  // flag for confirmation received
+    auto start = std::chrono::steady_clock::now();  // track overall timeout
 
-    // initial send
+    // send initial packet (first attempt)
     ssize_t rc = sendto(socketFd, msg.data(), msg.size(), 0, reinterpret_cast<const sockaddr*>(&serverAddr), sizeof(serverAddr));
     if (rc < 0) {
         perror("sendto");
     }
     printf_debug("send attempt %d for id=%d, bytes=%zd", attempts + 1, msgId, rc);
 
-    // loop until confirm or retries exhausted or terminated
+    // retry loop: continue until confirmed, too many retries, or client terminated
     while (!confirmed && attempts < maxRetransmissions && state != ClientState::TERMINATED) {
+        // check if overall timeout (5s) has been exceeded
         if (overallTimeoutExceeded(start)) {
             std::cout << "ERROR: Message transmission timeout (5 seconds)" << std::endl;
             return false;
         }
 
+        // wait for response with short timeout (configurable)
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(socketFd, &rfds);
         struct timeval tv{0, static_cast<int>(timeoutMs * 1000)};
         int ready = select(socketFd + 1, &rfds, nullptr, nullptr, &tv);
-        if (state == ClientState::TERMINATED) break;
+        if (state == ClientState::TERMINATED) break;  // check if client terminated during wait
 
         if (ready > 0) {
-            // handle incoming
+            // data is available to read - might be our confirmation or another message
             char buf[65536];
             sockaddr_in peer{};
             socklen_t len = sizeof(peer);
             ssize_t n = recvfrom(socketFd, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&peer), &len);
             if (n > 0) {
+                // check and update server port if it changed
                 checkAndUpdateServerPort(peer);
                 ParsedMessage resp = parseUdpMessage(buf, n);
 
+                // check if this is the confirmation we are waiting for
                 if (resp.type == MessageType::CONFIRM && resp.refMsgId == msgId) {
                     confirmed = true;
-                    break;
+                    break;  // exit retry loop, message confirmed
                 }
                 else if (resp.type != MessageType::UNKNOWN) {
-                    // ack other messages
+                    // not our confirmation, but valid message - must send ACK
                     auto ack = createUdpConfirmMessage(resp.msgId);
                     if (sendto(socketFd, ack.data(), ack.size(), 0,
                             reinterpret_cast<const sockaddr*>(&serverAddr), sizeof(serverAddr)) < 0) {
                         perror("sendto confirm");
                     }
+                    // also process the message
                     handleIncomingMessage(resp);
-                    if (state == ClientState::TERMINATED) break;
+                    if (state == ClientState::TERMINATED) {
+                        break;
+                    }
                 }
             }
-        } else {
-            // timed out -> retransmit
+        } 
+        else {
+            // select timeout without data - retransmit the message
             attempts++;
             ssize_t rc = sendto(socketFd, msg.data(), msg.size(), 0, reinterpret_cast<const sockaddr*>(&serverAddr), sizeof(serverAddr));
             if (rc < 0) perror("sendto");
@@ -138,12 +151,14 @@ bool UdpClient::sendUdpMessage(const std::vector<char>& msg, bool requireConfirm
         }
     }
 
+    // check final outcome of transmission attempt
     if (!confirmed) {
+        std::cout << "ERROR: Message transmission failed: no confirmation received\n";
         printf_debug("Failed to confirm id=%d after %d attempts", msgId, attempts + 1);
-        state = ClientState::TERMINATED;
+        state = ClientState::TERMINATED;  // fatal error - terminate client
         return false;
     }
-    return true;
+    return true;  // success - message was confirmed
 }
 
 // Send a message to the server and wait for confirmation
@@ -195,6 +210,24 @@ void UdpClient::sendProtocolError(const std::string& err) {
     auto m = createUdpErrMessage(id, displayName, err);
     sendUdpMessage(m, /*requireConfirm=*/false);
 }
+
+// Helper to send BYE and wait for its CONFIRM before quitting stdin-EOF
+void UdpClient::sendByeAndWaitConfirm() {
+    uint16_t byeId = getNextMsgId();
+    auto byeMsg  = createUdpByeMessage(byeId, displayName);
+    // reuse your reliable-usend logic
+    if (!sendUdpMessage(byeMsg, true)) {
+        std::cerr << "ERROR: Failed to send BYE or receive confirmation\n";
+    }
+}
+
+// Send a CONFIRM back to the server for the given message ID
+void UdpClient::sendConfirm(uint16_t msgId) {
+    auto confirmMsg = createUdpConfirmMessage(msgId);
+    sendto(socketFd, confirmMsg.data(), confirmMsg.size(), 0, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
+}
+
+// ===================================== Message Processing ======================================== //
 
 // Handle incoming UDP messages
 void UdpClient::handleIncomingMessage(const ParsedMessage& msg) {
@@ -276,62 +309,12 @@ bool UdpClient::awaitReply(uint16_t expectedRefId) {
     return false;
 }
 
-int UdpClient::handleStdinEvent(std::string& buf) {
-    char tmp[1024];
-    auto n = read(STDIN_FILENO, tmp, sizeof tmp);
-    if (n < 0) return (errno==EAGAIN)? EXIT_SUCCESS : EXIT_FAILURE;
-    if (n == 0) { sendByeAndWaitConfirm(); state = ClientState::TERMINATED; return EXIT_SUCCESS; }
-    buf.append(tmp, n);
-    size_t pos;
-    while ((pos = buf.find('\n')) != std::string::npos) {
-        processUserInput(buf.substr(0,pos));
-        buf.erase(0, pos+1);
-        if (state == ClientState::TERMINATED) return EXIT_FAILURE;
-    }
-    return EXIT_SUCCESS;
-}
-
-void UdpClient::handleSocketEvent(char* buf) {
-    sockaddr_in peer; socklen_t len = sizeof peer;
-    auto n = recvfrom(socketFd, buf, 65536, 0, (sockaddr*)&peer, &len);
-    if (n <= 0) return;
-    checkAndUpdateServerPort(peer);
-    auto msg = parseUdpMessage(buf, n);
-    if (msg.type == MessageType::CONFIRM) return;
-    sendConfirm(msg.msgId);
-    if (isDuplicate(msg.msgId)) return;
-    seenMsgIds.insert(msg.msgId);
-    handleIncomingMessage(msg);
-}
-
-// Send a CONFIRM back to the server for the given message ID
-void UdpClient::sendConfirm(uint16_t msgId) {
-    auto confirmMsg = createUdpConfirmMessage(msgId);
-    sendto(socketFd, confirmMsg.data(), confirmMsg.size(), 0, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr));
-}
-
 // Return true if we've already processed this server message ID
 bool UdpClient::isDuplicate(uint16_t msgId) {
     return seenMsgIds.find(msgId) != seenMsgIds.end();
 }
 
-// Helper to send BYE and wait for its CONFIRM before quitting stdin-EOF
-void UdpClient::sendByeAndWaitConfirm() {
-    uint16_t byeId = getNextMsgId();
-    auto byeMsg  = createUdpByeMessage(byeId, displayName);
-    // reuse your reliable-usend logic
-    if (!sendUdpMessage(byeMsg, true)) {
-        std::cerr << "ERROR: Failed to send BYE or receive confirmation\n";
-    }
-}
-
-// Clean up any resources (mirror what your base destructor does)
-void UdpClient::cleanup() {
-    if (socketFd != -1) {
-        close(socketFd);
-        socketFd = -1;
-    }
-}
+// ===================================== Socket & Connection Management ======================================== //
 
 // Initialize UDP socket: resolve, bind ephemeral, set serverAddr
 bool UdpClient::initSocket() {
@@ -387,47 +370,137 @@ bool UdpClient::setupEpoll() {
     return true;
 }
 
+// Clean up any resources (mirror what your base destructor does)
+void UdpClient::cleanup() {
+    if (socketFd != -1) {
+        close(socketFd);
+        socketFd = -1;
+    }
+}
+
+// ===================================== Event Loop & I/O Processing ======================================== //
+
 // Main event loop: handle stdin and socket until termination
 int UdpClient::eventLoop() {
     std::array<epoll_event, 16> events;
     std::string stdinBuf;
     char udpBuf[65536];
 
+    // loop until client terminates
     while (state != ClientState::TERMINATED) {
         // if requested, send BYE and exit loop
         if (terminationRequested) {
             sendByeAndWaitConfirm();
             break;
         }
+
+        // wait for events with 100ms timeout for periodic checks
         int n = epoll_wait(epollFd, events.data(), events.size(), 100);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                continue;
+            }
             perror("epoll_wait");
             return EXIT_FAILURE;
         }
+
+        // process each ready file descriptor
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
             if (fd == socketFd){
+                // handle incoming UDP packet
                 handleSocketEvent(udpBuf);
             }      
             else if (fd == STDIN_FILENO){
+                // handle user input, exit on fatal error
                 if (handleStdinEvent(stdinBuf) == EXIT_FAILURE)
                 return EXIT_FAILURE;
             }
         }
     }
+    // handle exit depending if a fatal error occurred
     return fatalError ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+
+int UdpClient::handleStdinEvent(std::string& buf) {
+    char tmp[1024];
+    auto n = read(STDIN_FILENO, tmp, sizeof tmp);
+    // handle errors or non-blocking status
+    if (n < 0) {
+        return (errno==EAGAIN) ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    // handle EOF (user pressed Ctrl+D) - gracefully exit
+    if (n == 0) { 
+        sendByeAndWaitConfirm();
+         state = ClientState::TERMINATED;
+          return EXIT_SUCCESS;
+    }
+    // append new data to buffer
+    buf.append(tmp, n);
+    size_t pos;
+
+    // process each complete line
+    while ((pos = buf.find('\n')) != std::string::npos) {
+        processUserInput(buf.substr(0,pos));
+        buf.erase(0, pos+1);
+        if (state == ClientState::TERMINATED){
+            return EXIT_FAILURE;
+        }
+    }
+    return EXIT_SUCCESS;
+}
+
+void UdpClient::handleSocketEvent(char* buf) {
+    sockaddr_in peer;
+    socklen_t len = sizeof peer;
+    // receive UDP packet and handle errors
+    auto n = recvfrom(socketFd, buf, 65536, 0, (sockaddr*)&peer, &len);
+    if (n <= 0) {
+        return;
+    }
+    // check if server changed ports and update
+    checkAndUpdateServerPort(peer);
+
+    // parse binary message format
+    auto msg = parseUdpMessage(buf, n);
+
+    // ignore CONFIRM messages - they are just ACKs
+    if (msg.type == MessageType::CONFIRM) {
+        return;
+    } 
+
+    // send confirmation for all other message types
+    sendConfirm(msg.msgId);
+
+    // drop duplicate messages
+    if (isDuplicate(msg.msgId)) {
+        return;
+    }
+
+    // record message ID to prevent duplicate processing
+    seenMsgIds.insert(msg.msgId);
+
+    // dispatch message for processing
+    handleIncomingMessage(msg);
 }
 
 // Initialize, epoll setup, run loop, then cleanup
 int UdpClient::run() {
+    // setup UDP socket and resolve server hostname
     if (!initSocket()){
         return EXIT_FAILURE;
-    }      
+    } 
+
+    // configure epoll to monitor both socket and stdin     
     if (!setupEpoll()){
         return EXIT_FAILURE;
-    }      
+    }
+    
+    // run the main event processing loop
     int rc = eventLoop();
+
+    // cleanup stuff before exiting
     cleanup();
+
     return rc;
 }

@@ -26,13 +26,16 @@
 
 extern volatile sig_atomic_t terminationRequested;  // flag set on SIGINT
 
+// ===================================== Constructors & Destructors ======================================== //
+
+
 // Constructor for TcpClient
 TcpClient::TcpClient(const std::string& serverIp, int port) : Client(false), serverAddress(serverIp), serverPort(port){}
 
 // Destructor
 TcpClient::~TcpClient() = default;
 
-extern volatile sig_atomic_t terminationRequested;  // flag set on SIGINT
+// ===================================== Message Transmission ======================================== //
 
 // Send raw string over TCP and return success
 bool TcpClient::sendMessage(const std::string& msg) {
@@ -97,6 +100,9 @@ bool TcpClient::sendByeMessage() {
     return false;
 }
 
+// ===================================== Message Processing ======================================== //
+
+
 // Handle received message and manage state/timeouts
 void TcpClient::handleIncomingMessage(const ParsedMessage& msg) {
     if (msg.type == MessageType::REPLY) {
@@ -126,15 +132,19 @@ void TcpClient::processSocketInput(std::string& buffer) {
                 std::cerr << "ERROR: " << e.what() << std::endl;  // log parse error
             }
         }
-    } else if (bytesRead == 0) {
+    } 
+    else if (bytesRead == 0) {
         sendByeMessage();  // server closed connection
-    } else {
+    } 
+    else {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             perror("read from socket");  // unexpected read error
             state = ClientState::TERMINATED;
         }
     }
 }
+
+// ===================================== Main Event Loop ======================================== //
 
 // Main event loop: resolve, connect, epoll setup, handle events
 int TcpClient::run() {
@@ -225,7 +235,10 @@ int TcpClient::run() {
                 if (fd == socketFd) {
                     // data from server
                     processSocketInput(socketBuffer);
-                    if (state == ClientState::TERMINATED) { running = false; break; }
+                    if (state == ClientState::TERMINATED) {
+                        running = false; 
+                        break; 
+                    }
                 } else {
                     // data from stdin
                     char buf[1024];
@@ -236,14 +249,19 @@ int TcpClient::run() {
                         while ((pos = stdinBuffer.find('\n')) != std::string::npos) {
                             processUserInput(stdinBuffer.substr(0, pos));
                             stdinBuffer.erase(0, pos + 1);
-                            if (state == ClientState::TERMINATED) { running = false; break; }
+                            if (state == ClientState::TERMINATED) { 
+                                running = false; 
+                                break; 
+                            }
                         }
-                    } else if (n == 0) {
+                    } 
+                    else if (n == 0) {
                         // eof on stdin
                         sendByeMessage();
                         running = false;
                         break;
-                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    } 
+                    else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                         perror("read stdin");  // unexpected stdin error
                     }
                 }

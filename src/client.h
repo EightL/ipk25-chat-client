@@ -5,7 +5,7 @@
  * This file sets up the basics for our chat client.
  * It handles simple user commands (/auth, /join, /rename, /help), does message checking, and keeps track of state.
  *
- * Author: xsevcim00
+ * @author: xsevcim00
  */
 #ifndef CLIENT_H
 #define CLIENT_H

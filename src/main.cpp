@@ -4,6 +4,9 @@
  *
  * This application implements a client for the IPK25-CHAT protocol,
  * supporting both TCP and UDP transport protocols.
+ * 
+ * This file parses command-line arguments, sets up signal handling,
+ * and initializes the appropriate client (TCP or UDP) based on user input.
  *
  * @author xsevcim00
  */
@@ -15,6 +18,9 @@
 #include <memory>
 #include "tcp_client.h"
 #include "udp_client.h"
+
+// ===================================== Signal Handling ======================================== //
+
 
 /**
  * @brief Global flag indicating that a graceful shutdown has been requested
@@ -35,16 +41,18 @@ void signalHandler(int signum) {
     terminationRequested = 1;
 }
 
+// ===================================== Argument Parsing ======================================== //
+
 /**
  * @struct ProgramArgs
  * @brief Parsed command-line arguments for the client application
  */
 struct ProgramArgs {
     std::string transport_protocol;  // "tcp" or "udp"
-    std::string server_address;      // server hostname or IP address
-    uint16_t    server_port = 4567;  // server port number (default: 4567)
-    uint16_t    udp_timeout = 250;   // UDP confirmation timeout in ms
-    uint8_t     udp_retransmissions = 3; // max UDP retransmissions
+    std::string server_address;   
+    uint16_t    server_port = 4567;   
+    uint16_t    udp_timeout = 250;   
+    uint8_t     udp_retransmissions = 3; 
 };
 
 /**
@@ -146,6 +154,9 @@ ProgramArgs parseArgs(int argc, char* argv[]) {
     return args;
 }
 
+// ===================================== Client Factory ======================================== //
+
+
 /**
  * @brief Factory function to instantiate the correct Client subclass
  *
@@ -156,19 +167,15 @@ ProgramArgs parseArgs(int argc, char* argv[]) {
  */
 std::unique_ptr<Client> createClient(const ProgramArgs& args) {
     if (args.transport_protocol == "udp") {
-        return std::make_unique<UdpClient>(
-            args.server_address,
-            args.server_port,
-            args.udp_timeout,
-            args.udp_retransmissions
-        );
+        return std::make_unique<UdpClient>(args.server_address, args.server_port, args.udp_timeout, args.udp_retransmissions);
     } else {
-        return std::make_unique<TcpClient>(
-            args.server_address,
-            args.server_port
-        );
+        return std::make_unique<TcpClient>(args.server_address, args.server_port);
     }
 }
+
+
+// ===================================== Main Application ======================================== //
+
 
 /**
  * @brief Application entry point
@@ -188,13 +195,13 @@ int main(int argc, char* argv[]) {
     // load and validate command-line arguments
     ProgramArgs args = parseArgs(argc, argv);
 
-        // log startup configuration to stderr
+        // log startup configuration to stderr, just for more info
         std::cerr << "Transport protocol: " << args.transport_protocol << std::endl;
-        std::cerr << "Server address: "   << args.server_address << std::endl;
-        std::cerr << "Server port: "      << args.server_port << std::endl;
+        std::cerr << "Server address: " << args.server_address << std::endl;
+        std::cerr << "Server port: " << args.server_port << std::endl;
         if (args.transport_protocol == "udp") {
-            std::cerr << "UDP timeout: "               << args.udp_timeout << " ms" << std::endl;
-            std::cerr << "UDP retransmissions: "      << static_cast<int>(args.udp_retransmissions) << std::endl;
+            std::cerr << "UDP timeout: " << args.udp_timeout << " ms" << std::endl;
+            std::cerr << "UDP retransmissions: " << static_cast<int>(args.udp_retransmissions) << std::endl;
         }
 
         // construct client instance
