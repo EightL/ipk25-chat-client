@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IPK25‑CHAT test‑server with readable debug logging.
+IPK25-CHAT test-server with readable debug logging.
 """
 import argparse
 import socket
