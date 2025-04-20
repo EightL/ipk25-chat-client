@@ -6,10 +6,37 @@
 - **login**: `xsevcim00`
 - **Institute**: VUT FIT 2024/2025
 
+## Table of Contents
+ 
+- [Overview](#overview)
+- [Motivation / How it works](#motivation--how-it-works)
+- [My implementation part](#my-implementation-part)
+- [Compiling the Project / Usage](#compiling-the-project)
+- [Project Architecture](#project-architecture)
+- [Control Flow / FSM](#control-flow--fsm)
+- [Key Implementation Points](#key-implementation-points)
+- [Tools & APIs](#tools--apis)
+- [References / License](#references)
+- [Testing](#testing)
+- [Additional Notes](#additional-notes)
+
+## Overview
+
+This project implements a CLI chat client, that includes both TCP and UDP versions. It makes use of an event-driven loop that maintains the responsiveness and realibility and graceful handling for network issues.
 
 ## Motivation / How it works
 
 With the first project done, still exhausted from it, I went right onto this second one. The key is to deeply understand whats really happening, especially with the diagrams provided by the specification. Since I had to implement both TCP and UDP variants, I had to understand certain tradeoffs between those two (connetion-oriented vs connectionless, reliability concerns, packet handling, message sending and so on..).
+
+### How it works
+- This is how basically chat clients work:  
+  ![General Client Workflow](/diagrams/generalClient.svg)
+
+#### Use cases
+- Chat clients are nowadays widely used everywhere, especially in Team collaboration (Microsoft Teams, Slack), Gaming (Discord, In-game chat), Customer support, Social Networks (Messenger, WhatsApp, Telegram) and in whole other different scenarios.
+
+#### Other common protocols
+- Some of the other common protocols and frameworks, that are being used are: IRC (Internet Relay Chat), XMPP, Matrix, WebSocket..
 
 In **IPK25-CHAT protocol** is a **IPv4 line-based chat API** that supports two transport variants:
 - **TCP** is a connection-oriented and reliable byte-stream, where the client and the server exchange CRLF-terminated commands like `AUTH`, `JOIN`, `BYE`, `MSG` and they rely on TCP's built-in ordering, retransmission and flow control.
@@ -20,9 +47,9 @@ In **IPK25-CHAT protocol** is a **IPv4 line-based chat API** that supports two t
 
   ![Client State Machine](/diagrams/udpMot.svg)
 
-## Overview
+---
 
-This project implements a CLI chat client, that includes both TCP and UDP versions. It makes use of an event-driven loop that maintains the responsiveness and realibility and graceful handling for network issues.
+## My implementation part:
 
 ### Key choices:
 
@@ -37,9 +64,6 @@ This project is implemented in **C++20**, mainly for features like `enum class`,
 
 I stuck with C++ because I'm taking a C++ course this semester, so it aligned nicely. Plus, having done the first project in C++, I was able to reuse and improve patterns I learned in the first project.
 
----
-
-## How my implementation works:
 
 1. **Initialization**: `main.cpp` parses command-line arguments with the help of `parseArgs` function, inits `signalHandler` for graceful termination and then uses `createClient()` to build either `TcpClient` or `UdpClient` depending on which we chose with `-t`.
 2. **Setup**: 
@@ -56,13 +80,6 @@ I stuck with C++ because I'm taking a C++ course this semester, so it aligned ni
 
 
 ---
-
-### Control Flow / FSM
-
-![Client State Machine](/diagrams/client.svg)
-
-
-While designinng this finite state machine, i was mainly following the FSM in the specification and enhanced it with some tweaks. This FSM is implemented in `client.cpp` and both TCP and UDP follow this. The client starts in `INIT`, transitions to `AUTHENTICATING` on /auth, and if successful reaches `JOINED` state. From there, it can either send messages in the current channel or enter `JOIN_WAITING` to switch channels. The `TERMINATED` state is a one-way exit - once we're there, we close the socket & exit. All error paths should be providing graceful fallbacks.
 
 
 ---
@@ -128,6 +145,15 @@ debug.h            Debug print macro (make debug)
 ![Main Project Structure](/diagrams/main.svg)
 
 The class diagram shows how I structured the codebase. The abstract `Client` class defines the FSM and common operations. `TcpClient/UdpClient` classes, which inherit from Client, implement the methods with their specific details. Everything is nicely in once place, while the tranport details for each client vary. The `MessageType` enum and the `ParsedMessage` struct provide a clean way to handle both text-based TCP frames and binary UDP datagrams.
+
+
+### Control Flow / FSM
+
+![Client State Machine](/diagrams/client.svg)
+
+
+While designinng this finite state machine, i was mainly following the FSM in the specification and enhanced it with some tweaks. This FSM is implemented in `client.cpp` and both TCP and UDP follow this. The client starts in `INIT`, transitions to `AUTHENTICATING` on /auth, and if successful reaches `JOINED` state. From there, it can either send messages in the current channel or enter `JOIN_WAITING` to switch channels. The `TERMINATED` state is a one-way exit - once we're there, we close the socket & exit. All error paths should be providing graceful fallbacks.
+
 
 ---
 
@@ -736,7 +762,12 @@ During my implementation of this project, I mainly used the discord server `anto
 ---
 
 ### Additional Notes:
-All diagrams were created with PlantUML
 
-- **PlantUML** – Open-source tool to draw UML and other diagrams from plain text.  
+- **Use of generative AI:** I used LLM models to help me understand certain topics needed for completing this project. For my implementation, it helped me define a general, clean and simple bone structure for this project that I stuck with, as well as some help with final refactorization, to make this project clean, tidy and professional.
+
+- All diagrams were created with **PlantUML**
+
+  - **PlantUML** – Open-source tool to draw UML and other diagrams from plain text.  
   https://plantuml.com/
+
+- **My Git repo**: https://git.fit.vutbr.cz/xsevcim00/IPK-Project-2.git 
